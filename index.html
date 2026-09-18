@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#07130f" />
+    <meta
+      name="description"
+      content="KBO 경기 승률과 포지션별 안타 확률을 한눈에 확인하는 프로토타입"
+    />
+    <title>PLAYBALL — KBO 오늘의 예측</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Noto+Sans+KR:wght@400;500;600;700;800;900&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="noise" aria-hidden="true"></div>
+    <header class="site-header">
+      <a class="brand" href="#" aria-label="PLAYBALL 홈">
+        <span class="brand-mark">P</span>
+        <span>PLAYBALL</span>
+      </a>
+      <nav class="desktop-nav" aria-label="주요 메뉴">
+        <a class="active" href="#games">오늘의 예측</a>
+        <a href="#hitters">타자 랭킹</a>
+        <a href="#method">예측 방식</a>
+      </nav>
+      <div id="liveStatus" class="live-badge"><i></i> 공식 데이터 연결</div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <div class="eyebrow"><span>2026 SEASON</span> · KBO GAME INTELLIGENCE</div>
+          <h1 id="hero-title">오늘의 야구,<br /><em>숫자로 먼저 봅니다.</em></h1>
+          <p>
+            선발 투수부터 타자 매치업까지. 경기 전에 필요한 핵심만 모아
+            승리와 안타 가능성을 보여드립니다.
+          </p>
+        </div>
+        <div class="hero-score" aria-label="서비스 특징">
+          <div><strong>2</strong><span>예측 모델</span></div>
+          <div><strong>9</strong><span>수비 포지션</span></div>
+          <div><strong>10</strong><span>KBO 구단</span></div>
+        </div>
+      </section>
+
+      <section class="date-bar" aria-label="날짜 선택">
+        <button id="prevDate" class="icon-button" type="button" aria-label="이전 날짜">←</button>
+        <button id="datePicker" class="date-display" type="button" aria-label="날짜 직접 선택">
+          <span id="dateText"></span>
+          <small id="dateSubText"></small>
+        </button>
+        <input id="nativeDate" class="native-date" type="date" aria-label="날짜" />
+        <button id="nextDate" class="icon-button" type="button" aria-label="다음 날짜">→</button>
+        <button id="todayButton" class="today-button" type="button">오늘</button>
+      </section>
+
+      <aside id="dataNotice" class="demo-notice" role="note">
+        <span>OFFICIAL DATA</span>
+        KBO 공식 데이터를 불러오는 중입니다.
+      </aside>
+
+      <section id="games" class="content-section" aria-labelledby="games-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">GAME FORECAST</p>
+            <h2 id="games-title">경기 승리 예측</h2>
+          </div>
+          <div id="lineupLegend" class="status-legend"><i></i> 라인업 확인 중</div>
+        </div>
+        <div id="gameGrid" class="game-grid"></div>
+      </section>
+
+      <section id="hitters" class="content-section hitters-section" aria-labelledby="hitters-title">
+        <div class="section-heading hitters-heading">
+          <div>
+            <p class="section-kicker">HIT PROBABILITY</p>
+            <h2 id="hitters-title">포지션별 안타 후보</h2>
+            <p class="section-description">오늘 출전 예상 선수의 1안타 이상 확률입니다.</p>
+          </div>
+          <div class="ranking-unit">확률 높은 순 <span>TOP 3</span></div>
+        </div>
+        <div id="positionFilters" class="position-filters" role="tablist" aria-label="포지션 선택"></div>
+        <div id="hitterContent" class="hitter-content"></div>
+      </section>
+
+      <section id="method" class="method-section" aria-labelledby="method-title">
+        <div>
+          <p class="section-kicker">HOW IT WORKS</p>
+          <h2 id="method-title">결과보다 근거를<br />먼저 보여드립니다.</h2>
+        </div>
+        <ol class="method-list">
+          <li><span>01</span><div><strong>KBO 공식 기록 수집</strong><p>당일 일정·예고 선발·라인업과 시즌 팀 및 선수 기록을 가져옵니다.</p></div></li>
+          <li><span>02</span><div><strong>설명 가능한 통계 추정</strong><p>팀 득점력·평균자책점·출루율과 홈 이점을 결합해 경기 승률을 계산합니다.</p></div></li>
+          <li><span>03</span><div><strong>타석별 안타 확률 계산</strong><p>보정 시즌 타율, 상대 투수력과 타순별 예상 타수를 이용해 1안타 이상 확률을 구합니다.</p></div></li>
+        </ol>
+      </section>
+    </main>
+
+    <footer>
+      <div class="brand footer-brand"><span class="brand-mark">P</span><span>PLAYBALL</span></div>
+      <p>출처: KBO 공식 홈페이지 · 통계 추정치는 경기 결과를 보장하지 않습니다.</p>
+      <p>© 2026 PLAYBALL LAB</p>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
