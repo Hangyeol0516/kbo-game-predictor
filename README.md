@@ -49,7 +49,7 @@ python3 server.py
 - 반응형 데스크톱·모바일 화면
 - 날짜 이동 및 직접 선택
 - KBO 공식 일정·예고 선발·라인업·시즌 기록 수집
-- 예고 선발 ERA·WHIP을 반영한 `stats-v2-starter` 승률
+- 예고 선발 ERA·WHIP과 최근 3일 불펜 부하를 반영한 `stats-v4-matchup` 승률
 - 경기별 예측 근거 열기·닫기
 - 전체·포수·내야 포지션·좌익수·중견수·우익수·지명타자별 안타 확률 상위 3명
 - 데이터 출처·갱신 시각·라인업 상태 표시
@@ -57,11 +57,14 @@ python3 server.py
 - 경기 종료 후 결과 자동 수집과 적중률·Brier Score 표시
 - PostgreSQL 전환용 스키마
 - 저장된 데이터를 날짜순으로 평가하고 CSV로 내보내는 백테스트 도구
+- 15분 주기의 자동 스냅샷·결과 수집기
+- 검증 성능이 개선될 때만 활성화되는 Platt 확률 보정 학습기
+- 좌투·우투·언더 유형별 시즌 타격 스플릿을 반영한 안타 확률
 
 ## 계산 범위와 한계
 
-- 경기 승률은 팀 득점/경기, 팀 ERA, 출루율, 예고 선발 ERA·WHIP과 홈 이점을 결합한 설명형 통계 추정치입니다.
-- 안타 확률은 시즌 타율을 리그 평균으로 표본 보정한 뒤 상대 선발 ERA와 타순별 예상 타수를 반영합니다.
+- 경기 승률은 팀 득점/경기, 팀 ERA, 출루율, 예고 선발 ERA·WHIP, 최근 3일 불펜 투구 수·연투 인원과 홈 이점을 결합한 설명형 통계 추정치입니다.
+- 안타 확률은 시즌 타율과 상대 선발 유형별 타율을 표본 보정한 뒤 상대 선발 ERA와 타순별 예상 타수를 반영합니다.
 - 아직 과거 경기로 학습하거나 백테스트한 ML 모델이 아닙니다. 결과는 참고용이며 경기 결과를 보장하지 않습니다.
 - 공식 라인업 발표 전에는 KBO 게임센터가 제공하는 최근 라인업을 사용합니다.
 
@@ -74,15 +77,25 @@ python3 server.py
 누적된 예측을 시간순으로 평가하고 CSV 데이터셋으로 내보냅니다.
 
 ```bash
-python3 scripts/backtest.py --db data/playball.db
-python3 scripts/backtest.py --db data/playball.db --export data/evaluated_predictions.csv
+docker compose exec playball python scripts/backtest.py --db /data/playball.db
+docker compose exec playball python scripts/backtest.py \
+  --db /data/playball.db \
+  --export /data/evaluated_predictions.csv
 ```
+
+종료 경기 100개 이상이 쌓이면 날짜 앞 80%로 학습하고 뒤 20%로 검증하는 확률 보정기를 만들 수 있습니다. 검증 Brier Score가 개선되지 않으면 파일을 생성하지 않습니다.
+
+```bash
+docker compose exec playball python scripts/train_calibrator.py \
+  --db /data/playball.db \
+  --output /data/calibration.json
+```
+
+Docker에서는 `/data/calibration.json`이 자동으로 감지됩니다.
 
 과거 경기의 현재 시즌 최종 기록을 이용해 과거 예측을 재구성하면 미래 정보가 섞이므로 그렇게 하지 않습니다. 데이터셋은 실제 경기 전에 저장된 스냅샷부터 축적합니다.
 
 ## 남은 구현 순서
 
-1. 최근 3일 불펜 투구 수와 연투 여부 수집
-2. 타자·투수 좌우 유형과 상대 전적 수집
-3. 충분한 경기 전 스냅샷 축적
-4. 날짜순 검증과 calibration을 거친 학습 모델 도입
+1. 엔트리·부상 및 구장·날씨 특성 추가
+2. 충분한 경기 전 스냅샷 축적 후 보정 학습기 활성화

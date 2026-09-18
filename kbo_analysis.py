@@ -9,10 +9,12 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 import re
 import statistics
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,6 +33,7 @@ TEAM_HITTER_2 = f"{BASE_URL}/Record/Team/Hitter/Basic2.aspx"
 TEAM_PITCHER_1 = f"{BASE_URL}/Record/Team/Pitcher/Basic1.aspx"
 PLAYER_HITTER_1 = f"{BASE_URL}/Record/Player/HitterBasic/Basic1.aspx"
 PLAYER_PITCHER_1 = f"{BASE_URL}/Record/Player/PitcherBasic/Basic1.aspx"
+PLAYER_HITTER_SITUATION = f"{BASE_URL}/Record/Player/HitterBasic/Situation.aspx"
 
 TEAM_CODES = {
     "KT": "KT", "SS": "삼성", "LG": "LG", "HT": "KIA", "OB": "두산",
@@ -84,11 +87,33 @@ class FormParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.inputs: dict[str, str] = {}
+        self.selects: dict[str, str] = {}
+        self._select_name: str | None = None
+        self._first_option: str | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr = dict(attrs)
         if tag == "input" and attr.get("name"):
             self.inputs[attr["name"]] = attr.get("value") or ""
+        elif tag == "select":
+            self._select_name = attr.get("name")
+            self._first_option = None
+        elif tag == "option" and self._select_name:
+            value = attr.get("value") or ""
+            if self._first_option is None:
+                self._first_option = value
+            if "selected" in attr:
+                self.selects[self._select_name] = value
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "select" and self._select_name:
+            self.selects.setdefault(self._select_name, self._first_option or "")
+            self._select_name = None
+            self._first_option = None
+
+    @property
+    def fields(self) -> dict[str, str]:
+        return {**self.inputs, **self.selects}
 
 
 def _number(value: str, default: float = 0.0) -> float:
@@ -118,6 +143,20 @@ def _post_json(path: str, payload: dict[str, str]) -> Any:
     )
     with urlopen(request, timeout=15) as response:
         return json.loads(response.read())
+
+
+def _post_webform(opener, url: str, current_html: str, target: str, updates: dict[str, str]) -> str:
+    parser = FormParser()
+    parser.feed(current_html)
+    fields = parser.fields
+    fields["__EVENTTARGET"] = target
+    fields["__EVENTARGUMENT"] = ""
+    fields.update(updates)
+    request = Request(
+        url, data=urlencode(fields).encode(),
+        headers={"User-Agent": USER_AGENT, "Referer": url, "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    return opener.open(request, timeout=15).read().decode("utf-8")
 
 
 def _table_rows(url: str) -> list[list[str]]:
@@ -161,6 +200,132 @@ def fetch_lineup(game: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def fetch_pitcher_hand(game: dict[str, Any], side: str) -> dict[str, str]:
+    name_key, team_key = (("T_PIT_P_NM", "AWAY_NM") if side == "away" else ("B_PIT_P_NM", "HOME_NM"))
+    name = game.get(name_key, "").strip()
+    raw = _post_json("/ws/Controls.asmx/GetSearchPlayer", {"name": name}) if name else {"now": []}
+    candidates = [item for item in raw.get("now", []) if item.get("P_NM") == name and item.get("T_NM") == game[team_key]]
+    pitcher_type = candidates[0].get("P_TYPE", "") if candidates else ""
+    if pitcher_type.startswith("좌"):
+        split, label = "LO", "좌투"
+    elif "언" in pitcher_type:
+        split, label = "LU,RU", "언더"
+    else:
+        split, label = "RO", "우투"
+    return {"team": game[team_key], "name": name, "type": pitcher_type, "split": split, "label": label}
+
+
+def fetch_pitcher_hands(games: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    jobs = [(game, side) for game in games for side in ("away", "home")]
+    with ThreadPoolExecutor(max_workers=min(6, len(jobs))) as executor:
+        values = list(executor.map(lambda job: fetch_pitcher_hand(*job), jobs))
+    return {value["team"]: value for value in values}
+
+
+def fetch_matchup_hitter_stats(team_splits: dict[str, str]) -> dict[tuple[str, str, str], dict[str, float]]:
+    """상대 선발 유형(좌/우/언더)별 타자의 시즌 스플릿을 팀 단위로 가져온다."""
+    cookie_jar = CookieJar()
+    opener = build_opener(HTTPCookieProcessor(cookie_jar))
+    current_html = _get_text(PLAYER_HITTER_SITUATION, opener)
+    situation_target = "ctl00$ctl00$ctl00$cphContents$cphContents$cphContents$ddlSituation$ddlSituation"
+    detail_target = "ctl00$ctl00$ctl00$cphContents$cphContents$cphContents$ddlSituationDetail$ddlSituationDetail"
+    team_target = "ctl00$ctl00$ctl00$cphContents$cphContents$cphContents$ddlTeam$ddlTeam"
+    current_html = _post_webform(opener, PLAYER_HITTER_SITUATION, current_html, situation_target, {situation_target: "41"})
+    result: dict[tuple[str, str, str], dict[str, float]] = {}
+    for split in ("LO", "RO", "LU,RU"):
+        teams = [team_id for team_id, requested_split in team_splits.items() if requested_split == split]
+        if not teams:
+            continue
+        current_html = _post_webform(
+            opener, PLAYER_HITTER_SITUATION, current_html, detail_target,
+            {situation_target: "41", detail_target: split, team_target: ""},
+        )
+        for team_id in teams:
+            current_html = _post_webform(
+                opener, PLAYER_HITTER_SITUATION, current_html, team_target,
+                {situation_target: "41", detail_target: split, team_target: team_id},
+            )
+            parser = TableParser(("tData01",))
+            parser.feed(current_html)
+            for row in parser.rows:
+                if len(row) >= 14 and row[0] != "순위":
+                    name, team = row[1].lstrip("* "), row[2]
+                    result[(team, name, split)] = {
+                        "avg": _number(row[3]), "ab": _number(row[4]), "hits": _number(row[5]),
+                    }
+    return result
+
+
+def fetch_boxscore_pitchers(game: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """종료 경기 박스스코어에서 팀별 투수와 투구 수를 가져온다."""
+    raw = _post_json(
+        "/ws/Schedule.asmx/GetBoxScoreScroll",
+        {
+            "leId": str(game["LE_ID"]), "srId": str(game["SR_ID"]),
+            "seasonId": str(game["SEASON_ID"]), "gameId": game["G_ID"],
+        },
+    )
+    result: dict[str, list[dict[str, Any]]] = {}
+    for team, item in zip((game["AWAY_NM"], game["HOME_NM"]), raw.get("arrPitcher", [])):
+        grid = json.loads(item["table"])
+        pitchers = []
+        for row in grid.get("rows", []):
+            cells = [html.unescape(str(cell.get("Text", ""))).replace("&nbsp;", "").strip() for cell in row.get("row", [])]
+            if len(cells) >= 9:
+                pitchers.append({
+                    "name": cells[0], "starter": cells[1] == "선발",
+                    "pitches": int(_number(cells[8])),
+                })
+        result[team] = pitchers
+    return result
+
+
+def fetch_recent_bullpen(target_date: str, team_names: list[str]) -> dict[str, dict[str, Any]]:
+    """경기일 직전 3일의 불펜 투구 수와 연투 인원을 계산한다."""
+    base_date = datetime.strptime(target_date, "%Y-%m-%d")
+    recent_games: list[dict[str, Any]] = []
+    for days_ago in range(1, 4):
+        game_date = (base_date - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        for game in fetch_games(game_date):
+            if bool(game.get("GAME_RESULT_CK")) and (game["AWAY_NM"] in team_names or game["HOME_NM"] in team_names):
+                game["_analysis_date"] = game_date
+                recent_games.append(game)
+
+    workloads = {
+        team: {"pitches": 0, "appearances": 0, "relievers": set(), "appearance_dates": defaultdict(set)}
+        for team in team_names
+    }
+    if recent_games:
+        with ThreadPoolExecutor(max_workers=min(6, len(recent_games))) as executor:
+            boxscores = list(executor.map(fetch_boxscore_pitchers, recent_games))
+        for game, boxscore in zip(recent_games, boxscores):
+            for team, pitchers in boxscore.items():
+                if team not in workloads:
+                    continue
+                for pitcher in pitchers:
+                    if pitcher["starter"]:
+                        continue
+                    workloads[team]["pitches"] += pitcher["pitches"]
+                    workloads[team]["appearances"] += 1
+                    workloads[team]["relievers"].add(pitcher["name"])
+                    workloads[team]["appearance_dates"][pitcher["name"]].add(game["_analysis_date"])
+
+    yesterday = (base_date - timedelta(days=1)).strftime("%Y-%m-%d")
+    two_days_ago = (base_date - timedelta(days=2)).strftime("%Y-%m-%d")
+    result = {}
+    for team, workload in workloads.items():
+        back_to_back = sum(
+            yesterday in dates and two_days_ago in dates
+            for dates in workload["appearance_dates"].values()
+        )
+        result[team] = {
+            "pitches": workload["pitches"], "appearances": workload["appearances"],
+            "relievers": len(workload["relievers"]), "backToBack": back_to_back,
+            "fatigueScore": workload["pitches"] + 12 * back_to_back,
+        }
+    return result
+
+
 def fetch_team_stats() -> dict[str, dict[str, float]]:
     hitting_1, hitting_2, pitching_1 = (_table_rows(url) for url in (TEAM_HITTER_1, TEAM_HITTER_2, TEAM_PITCHER_1))
     stats: dict[str, dict[str, float]] = {}
@@ -187,18 +352,7 @@ def _fetch_team_filtered_rows(url: str, team_ids: list[str]) -> list[list[str]]:
     target = "ctl00$ctl00$ctl00$cphContents$cphContents$cphContents$ddlTeam$ddlTeam"
     rows: list[list[str]] = []
     for team_id in team_ids:
-        form_parser = FormParser()
-        form_parser.feed(current_html)
-        fields = form_parser.inputs
-        fields["__EVENTTARGET"] = target
-        fields["__EVENTARGUMENT"] = ""
-        fields[target] = team_id
-        request = Request(
-            url,
-            data=urlencode(fields).encode(),
-            headers={"User-Agent": USER_AGENT, "Referer": url, "Content-Type": "application/x-www-form-urlencoded"},
-        )
-        current_html = opener.open(request, timeout=15).read().decode("utf-8")
+        current_html = _post_webform(opener, url, current_html, target, {target: team_id})
         parser = TableParser(("tData01",))
         parser.feed(current_html)
         rows.extend(row for row in parser.rows if row and row[0] != "순위")
@@ -235,9 +389,32 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     return statistics.mean(values), max(statistics.pstdev(values), 0.001)
 
 
+def load_calibrator() -> dict[str, Any] | None:
+    path = os.environ.get("PLAYBALL_CALIBRATION_PATH", "data/calibration.json")
+    try:
+        with open(path, encoding="utf-8") as stream:
+            calibrator = json.load(stream)
+        if calibrator.get("enabled") and calibrator.get("kind") == "platt":
+            return calibrator
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def calibrate_probability(probability: float, calibrator: dict[str, Any] | None) -> float:
+    if not calibrator:
+        return probability
+    bounded = min(max(probability, 0.001), 0.999)
+    logit = math.log(bounded / (1 - bounded))
+    score = max(min(calibrator["slope"] * logit + calibrator["intercept"], 30), -30)
+    calibrated = 1 / (1 + math.exp(-score))
+    return min(max(calibrated, 0.20), 0.80)
+
+
 def _game_prediction(
     game: dict[str, Any], team_stats: dict[str, dict[str, float]],
-    pitcher_stats: dict[tuple[str, str], dict[str, float]],
+    pitcher_stats: dict[tuple[str, str], dict[str, float]], bullpen_stats: dict[str, dict[str, Any]],
+    calibrator: dict[str, Any] | None,
 ) -> dict[str, Any]:
     away_name, home_name = game["AWAY_NM"], game["HOME_NM"]
     away, home = team_stats[away_name], team_stats[home_name]
@@ -264,10 +441,19 @@ def _game_prediction(
 
     away_starter_rating = starter_rating(away_starter, away)
     home_starter_rating = starter_rating(home_starter, home)
-    home_logit = 0.13 + 0.50 * (rating(home) - rating(away)) + 0.20 * (home_starter_rating - away_starter_rating)
+    fatigue_mean, fatigue_std = _mean_std([float(team["fatigueScore"]) for team in bullpen_stats.values()])
+    away_fatigue = (bullpen_stats[away_name]["fatigueScore"] - fatigue_mean) / fatigue_std
+    home_fatigue = (bullpen_stats[home_name]["fatigueScore"] - fatigue_mean) / fatigue_std
+    home_logit = (
+        0.13 + 0.50 * (rating(home) - rating(away))
+        + 0.20 * (home_starter_rating - away_starter_rating)
+        + 0.10 * (away_fatigue - home_fatigue)
+    )
     home_probability = 1 / (1 + math.exp(-home_logit))
-    # 부상·불펜 소모 변수를 아직 반영하지 않는 v2이므로 과신을 막는다.
+    # 부상·구장·날씨 변수를 아직 반영하지 않는 v4이므로 과신을 막는다.
     home_probability = min(max(home_probability, 0.28), 0.72)
+    raw_home_probability = home_probability
+    home_probability = calibrate_probability(home_probability, calibrator)
     home_percent = round(home_probability * 100)
     away_percent = 100 - home_percent
     pick = home_name if home_percent >= away_percent else away_name
@@ -286,6 +472,7 @@ def _game_prediction(
             f"{better_offense} 시즌 득점력 우위 ({team_stats[better_offense]['runs_per_game']:.2f}점/경기)",
             f"{better_pitching} 팀 평균자책점 우위 ({team_stats[better_pitching]['era']:.2f})",
             f"선발 ERA: {away_name} {away_starter.get('era', away['era']):.2f} · {home_name} {home_starter.get('era', home['era']):.2f}",
+            f"최근 3일 불펜 투구: {away_name} {bullpen_stats[away_name]['pitches']}구 · {home_name} {bullpen_stats[home_name]['pitches']}구",
             f"{away_name} 출루율 {away['obp']:.3f} · {home_name} 출루율 {home['obp']:.3f}",
             "홈 경기 기본 보정 3.2% 적용",
         ],
@@ -293,6 +480,12 @@ def _game_prediction(
             "awayRpg": round(away["runs_per_game"], 2), "homeRpg": round(home["runs_per_game"], 2),
             "awayEra": away["era"], "homeEra": home["era"],
             "awayStarterEra": away_starter.get("era"), "homeStarterEra": home_starter.get("era"),
+            "awayBullpenPitches3d": bullpen_stats[away_name]["pitches"],
+            "homeBullpenPitches3d": bullpen_stats[home_name]["pitches"],
+            "awayBackToBackRelievers": bullpen_stats[away_name]["backToBack"],
+            "homeBackToBackRelievers": bullpen_stats[home_name]["backToBack"],
+            "rawHomeProbability": round(raw_home_probability, 4),
+            "calibrated": bool(calibrator),
         },
     }
 
@@ -301,6 +494,8 @@ def _hitter_predictions(
     games: list[dict[str, Any]], lineups: dict[str, dict[str, Any]],
     hitter_stats: dict[tuple[str, str], dict[str, float]], team_stats: dict[str, dict[str, float]],
     pitcher_stats: dict[tuple[str, str], dict[str, float]],
+    pitcher_hands: dict[str, dict[str, str]],
+    matchup_hitter_stats: dict[tuple[str, str, str], dict[str, float]],
 ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
     league_avg = statistics.mean(team["avg"] for team in team_stats.values())
     league_era, league_era_std = _mean_std([team["era"] for team in team_stats.values()])
@@ -315,12 +510,16 @@ def _hitter_predictions(
                 stats = hitter_stats.get((player["team"], player["name"]), {})
                 ab, hits = stats.get("ab", 0), stats.get("hits", 0)
                 pa_average = (hits + 60 * league_avg) / (ab + 60)
+                hand = pitcher_hands.get(opponent, {"split": "RO", "label": "우투"})
+                split_stats = matchup_hitter_stats.get((player["team"], player["name"], hand["split"]), {})
+                split_ab, split_hits = split_stats.get("ab", 0), split_stats.get("hits", 0)
+                matchup_average = (split_hits + 35 * pa_average) / (split_ab + 35) if split_ab else pa_average
                 opponent_pitcher_name = game.get("B_PIT_P_NM" if side == "away" else "T_PIT_P_NM", "").strip()
                 opponent_pitcher = pitcher_stats.get((opponent, opponent_pitcher_name), {})
                 opponent_era = opponent_pitcher.get("era", team_stats[opponent]["era"])
                 pitcher_factor = 1 + 0.055 * (opponent_era - league_era) / league_era_std
                 pitcher_factor = min(max(pitcher_factor, 0.91), 1.09)
-                per_ab = min(max(pa_average * pitcher_factor, 0.12), 0.42)
+                per_ab = min(max(matchup_average * pitcher_factor, 0.12), 0.42)
                 expected_ab = max(3.55, 4.45 - 0.10 * (player["order"] - 1))
                 probability = round((1 - (1 - per_ab) ** expected_ab) * 100)
                 position = POSITION_GROUPS.get(player["position"])
@@ -331,7 +530,9 @@ def _hitter_predictions(
                     "rawPosition": player["position"], "probability": probability,
                     "opponent": f"vs {opponent}", "pitcher": f"상대 선발 {opponent_pitcher_name or '미정'}",
                     "order": f"{player['order']}번 타자", "avg": round(stats.get("avg", league_avg), 3),
-                    "ab": int(ab), "estimated": not bool(stats), "lineupConfirmed": lineup["confirmed"],
+                    "ab": int(ab), "matchupAvg": round(split_stats.get("avg", matchup_average), 3),
+                    "matchupAb": int(split_ab), "pitcherHand": hand["label"],
+                    "estimated": not bool(stats), "lineupConfirmed": lineup["confirmed"],
                 })
 
     result: dict[str, list[dict[str, Any]]] = {"전체": sorted(hitters, key=lambda item: item["probability"], reverse=True)[:3]}
@@ -361,26 +562,40 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
             return cached.value
 
     games = fetch_games(date)
+    calibrator = load_calibrator()
+    method_version = "stats-v4-matchup+platt-v1" if calibrator else "stats-v4-matchup"
     if not games:
-        result = {"date": date, "games": [], "hitters": {}, "updatedAt": datetime.now(KST).isoformat(timespec="seconds"), "source": "KBO 공식 홈페이지", "methodVersion": "stats-v2-starter", "snapshotEligible": False}
+        result = {"date": date, "games": [], "hitters": {}, "updatedAt": datetime.now(KST).isoformat(timespec="seconds"), "source": "KBO 공식 홈페이지", "methodVersion": method_version, "snapshotEligible": False}
     else:
         team_stats = fetch_team_stats()
         relevant_team_ids = list(dict.fromkeys([code for game in games for code in (game["AWAY_ID"], game["HOME_ID"])]))
-        with ThreadPoolExecutor(max_workers=max(2, min(6, len(games) + 2))) as executor:
+        pitcher_hands = fetch_pitcher_hands(games)
+        team_id_by_name = {name: code for code, name in TEAM_CODES.items()}
+        team_splits: dict[str, str] = {}
+        for game in games:
+            team_splits[team_id_by_name[game["AWAY_NM"]]] = pitcher_hands[game["HOME_NM"]]["split"]
+            team_splits[team_id_by_name[game["HOME_NM"]]] = pitcher_hands[game["AWAY_NM"]]["split"]
+        with ThreadPoolExecutor(max_workers=max(2, min(7, len(games) + 3))) as executor:
             lineup_futures = [executor.submit(fetch_lineup, game) for game in games]
             hitter_future = executor.submit(fetch_hitter_stats, relevant_team_ids)
             pitcher_future = executor.submit(fetch_pitcher_stats, relevant_team_ids)
+            bullpen_future = executor.submit(fetch_recent_bullpen, date, [TEAM_CODES[team_id] for team_id in relevant_team_ids])
+            matchup_future = executor.submit(fetch_matchup_hitter_stats, team_splits)
             lineup_results = [future.result() for future in lineup_futures]
             hitter_stats = hitter_future.result()
             pitcher_stats = pitcher_future.result()
+            bullpen_stats = bullpen_future.result()
+            matchup_hitter_stats = matchup_future.result()
         lineups = {game["G_ID"]: lineup for game, lineup in zip(games, lineup_results)}
-        game_predictions = [_game_prediction(game, team_stats, pitcher_stats) for game in games]
-        hitter_predictions, all_confirmed = _hitter_predictions(games, lineups, hitter_stats, team_stats, pitcher_stats)
+        game_predictions = [_game_prediction(game, team_stats, pitcher_stats, bullpen_stats, calibrator) for game in games]
+        hitter_predictions, all_confirmed = _hitter_predictions(
+            games, lineups, hitter_stats, team_stats, pitcher_stats, pitcher_hands, matchup_hitter_stats,
+        )
         result = {
             "date": date, "games": game_predictions, "hitters": hitter_predictions,
             "lineupStatus": "confirmed" if all_confirmed else "projected",
             "updatedAt": datetime.now(KST).isoformat(timespec="seconds"),
-            "source": "KBO 공식 홈페이지", "methodVersion": "stats-v2-starter",
+            "source": "KBO 공식 홈페이지", "methodVersion": method_version,
             "snapshotEligible": all(str(game.get("GAME_STATE_SC")) == "1" and not bool(game.get("GAME_RESULT_CK")) for game in games),
             "disclaimer": "공식 기록을 사용한 설명형 통계 추정치이며, 학습·백테스트된 예측 모델의 결과가 아닙니다.",
         }

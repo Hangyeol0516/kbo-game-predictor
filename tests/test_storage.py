@@ -17,7 +17,7 @@ class PredictionStoreTest(unittest.TestCase):
     def test_snapshot_is_idempotent_and_performance_is_scored(self):
         analysis = {
             "date": "2026-04-01", "updatedAt": "2026-04-01T12:00:00+09:00",
-            "methodVersion": "stats-v2-starter", "lineupStatus": "projected",
+            "methodVersion": "stats-v4-matchup", "lineupStatus": "projected",
             "snapshotEligible": True,
             "games": [{
                 "id": "20260401LGOB0", "away": "LG", "home": "두산",

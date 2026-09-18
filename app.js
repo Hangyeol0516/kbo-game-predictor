@@ -79,10 +79,10 @@ function renderHitters() {
   const lineupLabel = first.lineupConfirmed ? "확정 라인업" : "최근 라인업";
   content.innerHTML = `
     <article class="hitter-feature" data-number="1">
-      <div><div class="rank-label">NO. 1 · ${first.rawPosition}</div><h3 class="hitter-name">${first.name}</h3><div class="hitter-team">${teams[first.team]?.name || first.team}</div><div class="matchup-note"><span>${first.opponent}</span><span>${first.pitcher}</span><span>${first.order}</span><span>시즌 AVG ${first.avg.toFixed(3)} · ${lineupLabel}</span></div></div>
+      <div><div class="rank-label">NO. 1 · ${first.rawPosition}</div><h3 class="hitter-name">${first.name}</h3><div class="hitter-team">${teams[first.team]?.name || first.team}</div><div class="matchup-note"><span>${first.opponent}</span><span>${first.pitcher}</span><span>${first.order}</span><span>시즌 AVG ${first.avg.toFixed(3)}</span><span>vs ${first.pitcherHand} AVG ${first.matchupAvg.toFixed(3)} (${first.matchupAb}타수)</span><span>${lineupLabel}</span></div></div>
       <div class="probability-ring" style="background: conic-gradient(var(--green) ${first.probability * 3.6}deg, #263a31 0deg)"><div><strong>${first.probability}%</strong><span>1+ HIT</span></div></div>
     </article>
-    <div class="hitter-runners">${rest.map((player, index) => `<article class="runner-card"><strong>0${index + 2}</strong><div><h3>${player.name} <small>· ${player.rawPosition}</small></h3><p>${teams[player.team]?.name || player.team} · ${player.opponent} · AVG ${player.avg.toFixed(3)} · ${player.order}</p></div><span class="runner-prob">${player.probability}%</span></article>`).join("")}</div>`;
+    <div class="hitter-runners">${rest.map((player, index) => `<article class="runner-card"><strong>0${index + 2}</strong><div><h3>${player.name} <small>· ${player.rawPosition}</small></h3><p>${teams[player.team]?.name || player.team} · ${player.opponent} · 시즌 ${player.avg.toFixed(3)} · ${player.pitcherHand} 상대 ${player.matchupAvg.toFixed(3)} · ${player.order}</p></div><span class="runner-prob">${player.probability}%</span></article>`).join("")}</div>`;
 }
 
 function renderAnalysis() {
