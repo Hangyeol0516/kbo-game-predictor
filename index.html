@@ -27,6 +27,7 @@
       <nav class="desktop-nav" aria-label="주요 메뉴">
         <a class="active" href="#games">오늘의 예측</a>
         <a href="#hitters">타자 랭킹</a>
+        <a href="#performance">모델 성능</a>
         <a href="#method">예측 방식</a>
       </nav>
       <div id="liveStatus" class="live-badge"><i></i> 공식 데이터 연결</div>
@@ -89,6 +90,20 @@
         <div id="hitterContent" class="hitter-content"></div>
       </section>
 
+      <section id="performance" class="content-section performance-section" aria-labelledby="performance-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">MODEL SCORECARD</p>
+            <h2 id="performance-title">예측 성능</h2>
+            <p class="section-description">예측 시점의 스냅샷을 경기 종료 결과와 비교합니다.</p>
+          </div>
+          <div class="ranking-unit">TIME-ORDERED <span>NO LEAKAGE</span></div>
+        </div>
+        <div id="performanceContent" class="performance-content">
+          <div class="empty-state"><strong>성능 기록을 확인하고 있습니다.</strong>저장된 예측과 경기 결과를 대조합니다.</div>
+        </div>
+      </section>
+
       <section id="method" class="method-section" aria-labelledby="method-title">
         <div>
           <p class="section-kicker">HOW IT WORKS</p>
@@ -96,7 +111,7 @@
         </div>
         <ol class="method-list">
           <li><span>01</span><div><strong>KBO 공식 기록 수집</strong><p>당일 일정·예고 선발·라인업과 시즌 팀 및 선수 기록을 가져옵니다.</p></div></li>
-          <li><span>02</span><div><strong>설명 가능한 통계 추정</strong><p>팀 득점력·평균자책점·출루율과 홈 이점을 결합해 경기 승률을 계산합니다.</p></div></li>
+          <li><span>02</span><div><strong>설명 가능한 통계 추정</strong><p>팀 득점력·평균자책점·출루율, 예고 선발 ERA·WHIP과 홈 이점을 결합합니다.</p></div></li>
           <li><span>03</span><div><strong>타석별 안타 확률 계산</strong><p>보정 시즌 타율, 상대 투수력과 타순별 예상 타수를 이용해 1안타 이상 확률을 구합니다.</p></div></li>
         </ol>
       </section>

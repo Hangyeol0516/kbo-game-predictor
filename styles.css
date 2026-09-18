@@ -166,6 +166,31 @@ main { overflow: hidden; }
 .runner-card p { margin: 0; color: var(--muted); font-size: 10px; }
 .runner-card .runner-prob { font: 600 18px "IBM Plex Mono", monospace; }
 
+.performance-section { max-width: none; padding-left: max(24px, calc((100vw - 1200px) / 2)); padding-right: max(24px, calc((100vw - 1200px) / 2)); background: var(--ink); color: white; }
+.performance-section .section-kicker { color: var(--green); }
+.performance-section .section-description, .performance-section .ranking-unit { color: #89948e; }
+.performance-content { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: .85fr 1.15fr; gap: 16px; }
+.metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.metric-grid article { min-height: 145px; padding: 20px 18px; border: 1px solid #294137; border-radius: 9px; background: #0d1e17; display: flex; flex-direction: column; }
+.metric-grid span { color: #8d9b94; font-size: 11px; }
+.metric-grid strong { margin: auto 0 5px; font: 600 27px "IBM Plex Mono", monospace; }
+.metric-grid small { color: var(--green); font: 500 9px "IBM Plex Mono", monospace; }
+.performance-history { border: 1px solid #294137; border-radius: 9px; overflow: hidden; background: #0d1e17; }
+.performance-history h3 { margin: 0; padding: 14px 17px; border-bottom: 1px solid #294137; color: #9dacA4; font-size: 11px; }
+.result-row { display: grid; grid-template-columns: 78px 1fr auto; align-items: center; gap: 13px; padding: 11px 17px; border-bottom: 1px solid #1e332a; }
+.result-row:last-child { border-bottom: 0; }
+.result-row time { color: #6f8077; font: 500 9px "IBM Plex Mono", monospace; }
+.result-row strong, .result-row span { display: block; }
+.result-row strong { font-size: 12px; }
+.result-row span { margin-top: 3px; color: #73837b; font-size: 9px; }
+.result-badge { padding: 4px 7px; border-radius: 4px; font-size: 9px; }
+.result-badge.correct { color: var(--green); background: rgba(49,220,120,.12); }
+.result-badge.wrong { color: #ff8a65; background: rgba(255,107,53,.12); }
+.result-badge.tie { color: #c3c7c5; background: rgba(255,255,255,.08); }
+.performance-empty { min-height: 145px; padding: 30px; border: 1px dashed #385046; border-radius: 9px; display: grid; place-content: center; text-align: center; }
+.performance-empty strong { font-size: 15px; }
+.performance-empty p { margin: 7px 0 0; color: #7c8b84; font-size: 11px; }
+
 .method-section { max-width: 1200px; margin: 0 auto; padding: 88px 24px; display: grid; grid-template-columns: .85fr 1.15fr; gap: 100px; }
 .method-section h2 { font-size: 35px; }
 .method-list { list-style: none; margin: 0; padding: 0; }
@@ -197,6 +222,7 @@ footer { min-height: 110px; padding: 25px max(24px, calc((100vw - 1200px) / 2));
   .status-legend { margin-top: 10px; max-width: 110px; line-height: 1.5; }
   .game-grid { grid-template-columns: 1fr; }
   .hitter-content { grid-template-columns: 1fr; }
+  .performance-content { grid-template-columns: 1fr; }
   .method-section { padding: 65px 20px; grid-template-columns: 1fr; gap: 45px; }
   footer { flex-wrap: wrap; gap: 11px 20px; }
   footer p { margin: 0; }
@@ -216,4 +242,8 @@ footer { min-height: 110px; padding: 25px max(24px, calc((100vw - 1200px) / 2));
   .probability-ring::before { width: 88px; height: 88px; }
   .probability-ring strong { font-size: 25px; }
   .hitter-name { font-size: 33px; }
+  .metric-grid { grid-template-columns: 1fr; }
+  .metric-grid article { min-height: 105px; }
+  .result-row { grid-template-columns: 1fr auto; }
+  .result-row time { grid-column: 1 / -1; }
 }

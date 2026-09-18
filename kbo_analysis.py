@@ -15,7 +15,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from typing import Any
@@ -24,11 +24,13 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 
 BASE_URL = "https://www.koreabaseball.com"
+KST = timezone(timedelta(hours=9))
 USER_AGENT = "PLAYBALL/0.1 (+personal KBO analysis prototype)"
 TEAM_HITTER_1 = f"{BASE_URL}/Record/Team/Hitter/Basic1.aspx"
 TEAM_HITTER_2 = f"{BASE_URL}/Record/Team/Hitter/Basic2.aspx"
 TEAM_PITCHER_1 = f"{BASE_URL}/Record/Team/Pitcher/Basic1.aspx"
 PLAYER_HITTER_1 = f"{BASE_URL}/Record/Player/HitterBasic/Basic1.aspx"
+PLAYER_PITCHER_1 = f"{BASE_URL}/Record/Player/PitcherBasic/Basic1.aspx"
 
 TEAM_CODES = {
     "KT": "KT", "SS": "삼성", "LG": "LG", "HT": "KIA", "OB": "두산",
@@ -178,14 +180,12 @@ def fetch_team_stats() -> dict[str, dict[str, float]]:
     return stats
 
 
-def fetch_hitter_stats(team_ids: list[str]) -> dict[tuple[str, str], dict[str, float]]:
-    """WebForms 팀 필터를 순차 적용해 당일 참가 팀의 모든 타자를 가져온다."""
+def _fetch_team_filtered_rows(url: str, team_ids: list[str]) -> list[list[str]]:
     cookie_jar = CookieJar()
     opener = build_opener(HTTPCookieProcessor(cookie_jar))
-    current_html = _get_text(PLAYER_HITTER_1, opener)
+    current_html = _get_text(url, opener)
     target = "ctl00$ctl00$ctl00$cphContents$cphContents$cphContents$ddlTeam$ddlTeam"
-    result: dict[tuple[str, str], dict[str, float]] = {}
-
+    rows: list[list[str]] = []
     for team_id in team_ids:
         form_parser = FormParser()
         form_parser.feed(current_html)
@@ -194,20 +194,40 @@ def fetch_hitter_stats(team_ids: list[str]) -> dict[tuple[str, str], dict[str, f
         fields["__EVENTARGUMENT"] = ""
         fields[target] = team_id
         request = Request(
-            PLAYER_HITTER_1,
+            url,
             data=urlencode(fields).encode(),
-            headers={"User-Agent": USER_AGENT, "Referer": PLAYER_HITTER_1, "Content-Type": "application/x-www-form-urlencoded"},
+            headers={"User-Agent": USER_AGENT, "Referer": url, "Content-Type": "application/x-www-form-urlencoded"},
         )
         current_html = opener.open(request, timeout=15).read().decode("utf-8")
         parser = TableParser(("tData01",))
         parser.feed(current_html)
-        for row in parser.rows:
-            if len(row) >= 16 and row[0] != "순위":
-                name, team = row[1].lstrip("* "), row[2]
-                result[(team, name)] = {
-                    "avg": _number(row[3]), "games": _number(row[4]), "pa": _number(row[5]),
-                    "ab": _number(row[6]), "hits": _number(row[8]), "hr": _number(row[11]),
-                }
+        rows.extend(row for row in parser.rows if row and row[0] != "순위")
+    return rows
+
+
+def fetch_hitter_stats(team_ids: list[str]) -> dict[tuple[str, str], dict[str, float]]:
+    """WebForms 팀 필터를 순차 적용해 당일 참가 팀의 모든 타자를 가져온다."""
+    result: dict[tuple[str, str], dict[str, float]] = {}
+    for row in _fetch_team_filtered_rows(PLAYER_HITTER_1, team_ids):
+        if len(row) >= 16:
+            name, team = row[1].lstrip("* "), row[2]
+            result[(team, name)] = {
+                "avg": _number(row[3]), "games": _number(row[4]), "pa": _number(row[5]),
+                "ab": _number(row[6]), "hits": _number(row[8]), "hr": _number(row[11]),
+            }
+    return result
+
+
+def fetch_pitcher_stats(team_ids: list[str]) -> dict[tuple[str, str], dict[str, float]]:
+    """당일 참가 팀 투수의 시즌 ERA·WHIP·이닝을 가져온다."""
+    result: dict[tuple[str, str], dict[str, float]] = {}
+    for row in _fetch_team_filtered_rows(PLAYER_PITCHER_1, team_ids):
+        if len(row) >= 19:
+            name, team = row[1].lstrip("* "), row[2]
+            result[(team, name)] = {
+                "era": _number(row[3]), "games": _number(row[4]), "wins": _number(row[5]),
+                "losses": _number(row[6]), "innings": row[10], "whip": _number(row[18]),
+            }
     return result
 
 
@@ -215,7 +235,10 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     return statistics.mean(values), max(statistics.pstdev(values), 0.001)
 
 
-def _game_prediction(game: dict[str, Any], team_stats: dict[str, dict[str, float]]) -> dict[str, Any]:
+def _game_prediction(
+    game: dict[str, Any], team_stats: dict[str, dict[str, float]],
+    pitcher_stats: dict[tuple[str, str], dict[str, float]],
+) -> dict[str, Any]:
     away_name, home_name = game["AWAY_NM"], game["HOME_NM"]
     away, home = team_stats[away_name], team_stats[home_name]
     r_mean, r_std = _mean_std([team["runs_per_game"] for team in team_stats.values()])
@@ -228,9 +251,22 @@ def _game_prediction(game: dict[str, Any], team_stats: dict[str, dict[str, float
         on_base = (team["obp"] - o_mean) / o_std
         return 0.45 * offense + 0.35 * pitching + 0.20 * on_base
 
-    home_logit = 0.13 + 0.62 * (rating(home) - rating(away))
+    away_pitcher_name = game.get("T_PIT_P_NM", "").strip()
+    home_pitcher_name = game.get("B_PIT_P_NM", "").strip()
+    away_starter = pitcher_stats.get((away_name, away_pitcher_name), {})
+    home_starter = pitcher_stats.get((home_name, home_pitcher_name), {})
+    whip_mean, whip_std = _mean_std([team["whip"] for team in team_stats.values()])
+
+    def starter_rating(starter: dict[str, float], fallback: dict[str, float]) -> float:
+        era = starter.get("era", fallback["era"])
+        whip = starter.get("whip", fallback["whip"])
+        return 0.7 * ((e_mean - era) / e_std) + 0.3 * ((whip_mean - whip) / whip_std)
+
+    away_starter_rating = starter_rating(away_starter, away)
+    home_starter_rating = starter_rating(home_starter, home)
+    home_logit = 0.13 + 0.50 * (rating(home) - rating(away)) + 0.20 * (home_starter_rating - away_starter_rating)
     home_probability = 1 / (1 + math.exp(-home_logit))
-    # 선발 개인 지표와 부상 변수를 아직 반영하지 않는 v1이므로 과신을 막는다.
+    # 부상·불펜 소모 변수를 아직 반영하지 않는 v2이므로 과신을 막는다.
     home_probability = min(max(home_probability, 0.28), 0.72)
     home_percent = round(home_probability * 100)
     away_percent = 100 - home_percent
@@ -243,23 +279,28 @@ def _game_prediction(game: dict[str, Any], team_stats: dict[str, dict[str, float
     return {
         "id": game["G_ID"], "time": game["G_TM"], "park": game["S_NM"],
         "away": away_name, "home": home_name,
-        "awayPitcher": game.get("T_PIT_P_NM", "").strip() or "미정",
-        "homePitcher": game.get("B_PIT_P_NM", "").strip() or "미정",
+        "awayPitcher": away_pitcher_name or "미정", "homePitcher": home_pitcher_name or "미정",
         "awayProb": away_percent, "homeProb": home_percent, "pick": pick, "confidence": confidence,
         "lineupConfirmed": bool(game.get("LINEUP_CK")),
         "reasons": [
             f"{better_offense} 시즌 득점력 우위 ({team_stats[better_offense]['runs_per_game']:.2f}점/경기)",
             f"{better_pitching} 팀 평균자책점 우위 ({team_stats[better_pitching]['era']:.2f})",
+            f"선발 ERA: {away_name} {away_starter.get('era', away['era']):.2f} · {home_name} {home_starter.get('era', home['era']):.2f}",
             f"{away_name} 출루율 {away['obp']:.3f} · {home_name} 출루율 {home['obp']:.3f}",
             "홈 경기 기본 보정 3.2% 적용",
         ],
-        "metrics": {"awayRpg": round(away["runs_per_game"], 2), "homeRpg": round(home["runs_per_game"], 2), "awayEra": away["era"], "homeEra": home["era"]},
+        "metrics": {
+            "awayRpg": round(away["runs_per_game"], 2), "homeRpg": round(home["runs_per_game"], 2),
+            "awayEra": away["era"], "homeEra": home["era"],
+            "awayStarterEra": away_starter.get("era"), "homeStarterEra": home_starter.get("era"),
+        },
     }
 
 
 def _hitter_predictions(
     games: list[dict[str, Any]], lineups: dict[str, dict[str, Any]],
     hitter_stats: dict[tuple[str, str], dict[str, float]], team_stats: dict[str, dict[str, float]],
+    pitcher_stats: dict[tuple[str, str], dict[str, float]],
 ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
     league_avg = statistics.mean(team["avg"] for team in team_stats.values())
     league_era, league_era_std = _mean_std([team["era"] for team in team_stats.values()])
@@ -274,7 +315,10 @@ def _hitter_predictions(
                 stats = hitter_stats.get((player["team"], player["name"]), {})
                 ab, hits = stats.get("ab", 0), stats.get("hits", 0)
                 pa_average = (hits + 60 * league_avg) / (ab + 60)
-                pitcher_factor = 1 + 0.055 * (team_stats[opponent]["era"] - league_era) / league_era_std
+                opponent_pitcher_name = game.get("B_PIT_P_NM" if side == "away" else "T_PIT_P_NM", "").strip()
+                opponent_pitcher = pitcher_stats.get((opponent, opponent_pitcher_name), {})
+                opponent_era = opponent_pitcher.get("era", team_stats[opponent]["era"])
+                pitcher_factor = 1 + 0.055 * (opponent_era - league_era) / league_era_std
                 pitcher_factor = min(max(pitcher_factor, 0.91), 1.09)
                 per_ab = min(max(pa_average * pitcher_factor, 0.12), 0.42)
                 expected_ab = max(3.55, 4.45 - 0.10 * (player["order"] - 1))
@@ -285,7 +329,7 @@ def _hitter_predictions(
                 hitters.append({
                     "name": player["name"], "team": player["team"], "position": position,
                     "rawPosition": player["position"], "probability": probability,
-                    "opponent": f"vs {opponent}", "pitcher": f"상대 선발 {game.get('B_PIT_P_NM' if side == 'away' else 'T_PIT_P_NM', '').strip() or '미정'}",
+                    "opponent": f"vs {opponent}", "pitcher": f"상대 선발 {opponent_pitcher_name or '미정'}",
                     "order": f"{player['order']}번 타자", "avg": round(stats.get("avg", league_avg), 3),
                     "ab": int(ab), "estimated": not bool(stats), "lineupConfirmed": lineup["confirmed"],
                 })
@@ -318,21 +362,26 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
 
     games = fetch_games(date)
     if not games:
-        result = {"date": date, "games": [], "hitters": {}, "updatedAt": datetime.now().astimezone().isoformat(timespec="seconds"), "source": "KBO 공식 홈페이지", "methodVersion": "stats-v1"}
+        result = {"date": date, "games": [], "hitters": {}, "updatedAt": datetime.now(KST).isoformat(timespec="seconds"), "source": "KBO 공식 홈페이지", "methodVersion": "stats-v2-starter", "snapshotEligible": False}
     else:
         team_stats = fetch_team_stats()
         relevant_team_ids = list(dict.fromkeys([code for game in games for code in (game["AWAY_ID"], game["HOME_ID"])]))
-        with ThreadPoolExecutor(max_workers=min(4, len(games))) as executor:
-            lineup_results = list(executor.map(fetch_lineup, games))
+        with ThreadPoolExecutor(max_workers=max(2, min(6, len(games) + 2))) as executor:
+            lineup_futures = [executor.submit(fetch_lineup, game) for game in games]
+            hitter_future = executor.submit(fetch_hitter_stats, relevant_team_ids)
+            pitcher_future = executor.submit(fetch_pitcher_stats, relevant_team_ids)
+            lineup_results = [future.result() for future in lineup_futures]
+            hitter_stats = hitter_future.result()
+            pitcher_stats = pitcher_future.result()
         lineups = {game["G_ID"]: lineup for game, lineup in zip(games, lineup_results)}
-        hitter_stats = fetch_hitter_stats(relevant_team_ids)
-        game_predictions = [_game_prediction(game, team_stats) for game in games]
-        hitter_predictions, all_confirmed = _hitter_predictions(games, lineups, hitter_stats, team_stats)
+        game_predictions = [_game_prediction(game, team_stats, pitcher_stats) for game in games]
+        hitter_predictions, all_confirmed = _hitter_predictions(games, lineups, hitter_stats, team_stats, pitcher_stats)
         result = {
             "date": date, "games": game_predictions, "hitters": hitter_predictions,
             "lineupStatus": "confirmed" if all_confirmed else "projected",
-            "updatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "source": "KBO 공식 홈페이지", "methodVersion": "stats-v1",
+            "updatedAt": datetime.now(KST).isoformat(timespec="seconds"),
+            "source": "KBO 공식 홈페이지", "methodVersion": "stats-v2-starter",
+            "snapshotEligible": all(str(game.get("GAME_STATE_SC")) == "1" and not bool(game.get("GAME_RESULT_CK")) for game in games),
             "disclaimer": "공식 기록을 사용한 설명형 통계 추정치이며, 학습·백테스트된 예측 모델의 결과가 아닙니다.",
         }
 

@@ -8,10 +8,12 @@ import os
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from kbo_analysis import analyze
+from kbo_analysis import analyze, fetch_games
+from storage import PredictionStore
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+STORE = PredictionStore()
 
 
 class AppHandler(SimpleHTTPRequestHandler):
@@ -21,7 +23,14 @@ class AppHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            return self.send_json({"status": "ok"})
+            return self.send_json({"status": "ok", "database": str(STORE.path)})
+        if parsed.path == "/api/performance":
+            try:
+                STORE.sync_results(fetch_games)
+                return self.send_json(STORE.performance_summary())
+            except Exception as exc:
+                self.log_error("performance sync failed: %s", exc)
+                return self.send_json({"error": "성능 데이터를 갱신하지 못했습니다."}, 502)
         if parsed.path == "/api/analysis":
             params = parse_qs(parsed.query)
             date = params.get("date", [""])[0]
@@ -29,7 +38,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not date:
                 return self.send_json({"error": "date가 필요합니다."}, 400)
             try:
-                return self.send_json(analyze(date, force=force))
+                analysis = analyze(date, force=force)
+                STORE.save_analysis(analysis)
+                return self.send_json(analysis)
             except ValueError:
                 return self.send_json({"error": "날짜 형식은 YYYY-MM-DD여야 합니다."}, 400)
             except Exception as exc:

@@ -1,0 +1,19 @@
+services:
+  playball:
+    build: .
+    image: kbo-game-predictor:latest
+    container_name: kbo-game-predictor
+    restart: unless-stopped
+    ports:
+      - "${PLAYBALL_PORT:-8000}:8000"
+    volumes:
+      - playball_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  playball_data:

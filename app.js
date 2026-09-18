@@ -89,8 +89,30 @@ function renderAnalysis() {
   renderGames(); renderFilters(); renderHitters();
   const status = state.data.lineupStatus === "confirmed" ? "확정 라인업 반영" : "최근 라인업 기준";
   document.querySelector("#lineupLegend").innerHTML = `<i></i> ${status}`;
-  document.querySelector("#dataNotice").innerHTML = `<span>OFFICIAL DATA</span> 출처: KBO 공식 홈페이지 · ${formatUpdated(state.data.updatedAt)} 갱신 · 통계 추정식 stats-v1`;
+  document.querySelector("#dataNotice").innerHTML = `<span>OFFICIAL DATA</span> 출처: KBO 공식 홈페이지 · ${formatUpdated(state.data.updatedAt)} 갱신 · ${state.data.methodVersion}`;
   document.querySelector("#liveStatus").innerHTML = `<i></i> ${formatUpdated(state.data.updatedAt)} 갱신`;
+}
+
+async function loadPerformance() {
+  const container = document.querySelector("#performanceContent");
+  try {
+    const response = await fetch("/api/performance");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "성능 정보를 불러오지 못했습니다.");
+    const metric = (value, suffix = "") => value === null ? "—" : `${value}${suffix}`;
+    const recent = data.recent.length ? `<div class="performance-history"><h3>최근 채점 결과</h3>${data.recent.map(game => `
+      <article class="result-row">
+        <time>${game.date}</time><div><strong>${game.away} ${game.score} ${game.home}</strong><span>예측 ${game.pick} · 승리 ${game.winner}</span></div>
+        <b class="result-badge ${game.correct === true ? "correct" : game.correct === false ? "wrong" : "tie"}">${game.correct === true ? "적중" : game.correct === false ? "실패" : "무승부"}</b>
+      </article>`).join("")}</div>` : `<div class="performance-empty"><strong>첫 채점을 기다리는 중입니다.</strong><p>${data.message}</p></div>`;
+    container.innerHTML = `<div class="metric-grid">
+      <article><span>평가 경기</span><strong>${data.evaluatedGames}</strong><small>GAMES</small></article>
+      <article><span>승패 적중률</span><strong>${metric(data.accuracy, "%")}</strong><small>${data.correctGames} / ${data.decidedGames}</small></article>
+      <article><span>Brier Score</span><strong>${metric(data.brierScore)}</strong><small>낮을수록 정확</small></article>
+    </div>${recent}`;
+  } catch (error) {
+    container.innerHTML = `<div class="empty-state error-state"><strong>성능 정보를 표시할 수 없습니다.</strong>${error.message}</div>`;
+  }
 }
 
 async function loadAnalysis(force = false) {
@@ -101,7 +123,7 @@ async function loadAnalysis(force = false) {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "알 수 없는 오류가 발생했습니다.");
     if (requestId !== state.requestId) return;
-    state.data = payload; renderAnalysis();
+    state.data = payload; renderAnalysis(); loadPerformance();
   } catch (error) {
     if (requestId === state.requestId) renderError(error.message);
   } finally { state.loading = false; }
