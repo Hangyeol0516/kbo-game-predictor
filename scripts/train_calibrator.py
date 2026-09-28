@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from kbo_analysis import BASE_MODEL_VERSION  # noqa: E402
 from storage import PredictionStore  # noqa: E402
 
 
@@ -44,7 +45,10 @@ def main() -> None:
     parser.add_argument("--output", default="data/calibration.json")
     parser.add_argument("--minimum-games", type=int, default=100)
     args = parser.parse_args()
-    rows = [row for row in PredictionStore(args.db).evaluated_predictions() if row["winner"] is not None]
+    rows = [
+        row for row in PredictionStore(args.db).evaluated_predictions()
+        if row["winner"] is not None and row["model_version"] == BASE_MODEL_VERSION
+    ]
     if len(rows) < args.minimum_games:
         raise SystemExit(f"학습 중단: 최소 {args.minimum_games}경기가 필요하지만 현재 {len(rows)}경기입니다.")
     split = max(1, int(len(rows) * 0.8))
@@ -67,7 +71,8 @@ def main() -> None:
     if calibrated_brier >= baseline_brier:
         raise SystemExit(f"활성화 중단: 검증 Brier가 개선되지 않았습니다 ({baseline_brier:.4f} → {calibrated_brier:.4f}).")
     payload = {
-        "kind": "platt", "enabled": True, "slope": slope, "intercept": intercept,
+        "kind": "platt", "enabled": True, "baseModelVersion": BASE_MODEL_VERSION,
+        "slope": slope, "intercept": intercept,
         "trainedAt": datetime.now(KST).isoformat(timespec="seconds"), "samples": len(rows),
         "trainSamples": len(train), "validationSamples": len(validation),
         "baselineBrier": round(baseline_brier, 6), "calibratedBrier": round(calibrated_brier, 6),

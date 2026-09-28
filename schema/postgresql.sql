@@ -34,5 +34,25 @@ CREATE TABLE game_results (
     completed_at TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE value_bet_predictions (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    prediction_date DATE NOT NULL,
+    game_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    lineup_status TEXT NOT NULL CHECK (lineup_status IN ('projected', 'confirmed')),
+    created_at TIMESTAMPTZ NOT NULL,
+    favorite_team TEXT NOT NULL,
+    underdog_team TEXT NOT NULL,
+    underdog_odds NUMERIC(8,3) NOT NULL CHECK (underdog_odds > 1),
+    model_probability NUMERIC(6,5) NOT NULL CHECK (model_probability BETWEEN 0 AND 1),
+    market_probability NUMERIC(6,5) NOT NULL CHECK (market_probability BETWEEN 0 AND 1),
+    expected_return NUMERIC(8,5) NOT NULL,
+    return_advantage NUMERIC(8,5) NOT NULL,
+    bookmaker TEXT NOT NULL,
+    recommended BOOLEAN NOT NULL,
+    UNIQUE (prediction_date, game_id, model_version, lineup_status)
+);
+
 CREATE INDEX idx_game_predictions_date ON game_predictions(prediction_date);
 CREATE INDEX idx_game_results_date ON game_results(game_date);
+CREATE INDEX idx_value_bets_date ON value_bet_predictions(prediction_date);

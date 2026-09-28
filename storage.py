@@ -51,8 +51,28 @@ CREATE TABLE IF NOT EXISTS game_results (
     completed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS value_bet_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_date TEXT NOT NULL,
+    game_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    lineup_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    favorite_team TEXT NOT NULL,
+    underdog_team TEXT NOT NULL,
+    underdog_odds REAL NOT NULL CHECK (underdog_odds > 1),
+    model_probability REAL NOT NULL CHECK (model_probability BETWEEN 0 AND 1),
+    market_probability REAL NOT NULL CHECK (market_probability BETWEEN 0 AND 1),
+    expected_return REAL NOT NULL,
+    return_advantage REAL NOT NULL,
+    bookmaker TEXT NOT NULL,
+    recommended INTEGER NOT NULL CHECK (recommended IN (0, 1)),
+    UNIQUE (prediction_date, game_id, model_version, lineup_status)
+);
+
 CREATE INDEX IF NOT EXISTS idx_game_predictions_date ON game_predictions(prediction_date);
 CREATE INDEX IF NOT EXISTS idx_game_results_date ON game_results(game_date);
+CREATE INDEX IF NOT EXISTS idx_value_bets_date ON value_bet_predictions(prediction_date);
 """
 KST = timezone(timedelta(hours=9))
 
@@ -101,6 +121,23 @@ class PredictionStore:
                         game["homeProb"] / 100, game["pick"],
                     ),
                 )
+                value = game.get("valueBet") or {}
+                if value.get("available"):
+                    underdog = value["underdog"]
+                    connection.execute(
+                        """INSERT OR IGNORE INTO value_bet_predictions
+                           (prediction_date, game_id, model_version, lineup_status, created_at,
+                            favorite_team, underdog_team, underdog_odds, model_probability,
+                            market_probability, expected_return, return_advantage, bookmaker, recommended)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            analysis["date"], game["id"], model_version, lineup_status, created_at,
+                            value["favorite"]["team"], underdog["team"], underdog["odds"],
+                            underdog["modelProbability"] / 100, underdog["marketProbability"] / 100,
+                            underdog["expectedReturnPct"] / 100, value["returnAdvantagePp"] / 100,
+                            underdog["bookmaker"], int(value["recommendation"]),
+                        ),
+                    )
 
     def pending_dates(self) -> list[str]:
         with self.connect() as connection:
@@ -194,7 +231,40 @@ class PredictionStore:
             "accuracy": round(correct / len(decided) * 100, 1) if decided else None,
             "brierScore": round(sum(brier_values) / len(brier_values), 4) if brier_values else None,
             "recent": recent,
+            "valueBet": self.value_bet_performance(),
             "message": None if rows else "저장된 예측의 경기가 종료되면 성능 지표가 표시됩니다.",
+        }
+
+    def value_bet_performance(self) -> dict[str, Any]:
+        query = """
+        WITH ranked AS (
+          SELECT v.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY v.game_id
+                   ORDER BY CASE v.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, v.created_at DESC
+                 ) AS choice
+          FROM value_bet_predictions v
+          WHERE v.recommended = 1
+        )
+        SELECT v.prediction_date, v.game_id, v.underdog_team, v.underdog_odds,
+               v.expected_return, v.bookmaker, r.winner
+        FROM ranked v
+        JOIN game_results r ON r.game_id = v.game_id
+        WHERE v.choice = 1
+        ORDER BY v.prediction_date, v.game_id
+        """
+        with self.connect() as connection:
+            rows = connection.execute(query).fetchall()
+        settled = [row for row in rows if row["winner"] is not None]
+        profit = sum(
+            row["underdog_odds"] - 1 if row["winner"] == row["underdog_team"] else -1
+            for row in settled
+        )
+        wins = sum(row["winner"] == row["underdog_team"] for row in settled)
+        return {
+            "recommended": len(rows), "settled": len(settled), "wins": wins,
+            "profitUnits": round(profit, 3),
+            "roi": round(profit / len(settled) * 100, 1) if settled else None,
         }
 
 

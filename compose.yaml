@@ -6,6 +6,12 @@ services:
     restart: unless-stopped
     ports:
       - "${PLAYBALL_PORT:-8000}:8000"
+    environment:
+      PLAYBALL_ODDS_API_KEY: "${PLAYBALL_ODDS_API_KEY:-}"
+      PLAYBALL_ODDS_REGIONS: "${PLAYBALL_ODDS_REGIONS:-eu,au}"
+      PLAYBALL_UPSET_MIN_EV: "${PLAYBALL_UPSET_MIN_EV:-0.08}"
+      PLAYBALL_UPSET_MIN_EDGE: "${PLAYBALL_UPSET_MIN_EDGE:-0.05}"
+      PLAYBALL_UPSET_MIN_ADVANTAGE: "${PLAYBALL_UPSET_MIN_ADVANTAGE:-0.10}"
     volumes:
       - playball_data:/data
     healthcheck:

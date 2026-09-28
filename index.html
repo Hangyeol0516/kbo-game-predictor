@@ -26,6 +26,7 @@
       </a>
       <nav class="desktop-nav" aria-label="주요 메뉴">
         <a class="active" href="#games">오늘의 예측</a>
+        <a href="#value">역배 EV</a>
         <a href="#hitters">타자 랭킹</a>
         <a href="#performance">모델 성능</a>
         <a href="#method">예측 방식</a>
@@ -44,7 +45,7 @@
           </p>
         </div>
         <div class="hero-score" aria-label="서비스 특징">
-          <div><strong>2</strong><span>예측 모델</span></div>
+          <div><strong>3</strong><span>분석 뷰</span></div>
           <div><strong>9</strong><span>수비 포지션</span></div>
           <div><strong>10</strong><span>KBO 구단</span></div>
         </div>
@@ -75,6 +76,20 @@
           <div id="lineupLegend" class="status-legend"><i></i> 라인업 확인 중</div>
         </div>
         <div id="gameGrid" class="game-grid"></div>
+      </section>
+
+      <section id="value" class="content-section value-section" aria-labelledby="value-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">UNDERDOG VALUE</p>
+            <h2 id="value-title">정배를 포기할 가치가 있는가?</h2>
+            <p class="section-description">무마진 시장확률과 모델 승률을 비교해 최고 배당의 기대수익을 계산합니다.</p>
+          </div>
+          <div class="ranking-unit">EV = P × ODDS − 1</div>
+        </div>
+        <div id="valueContent" class="value-content">
+          <div class="empty-state"><strong>배당 가치를 확인하고 있습니다.</strong>시장 배당과 모델 승률을 대조합니다.</div>
+        </div>
       </section>
 
       <section id="hitters" class="content-section hitters-section" aria-labelledby="hitters-title">
@@ -110,16 +125,17 @@
           <h2 id="method-title">결과보다 근거를<br />먼저 보여드립니다.</h2>
         </div>
         <ol class="method-list">
-          <li><span>01</span><div><strong>KBO 공식 기록 수집</strong><p>당일 일정·예고 선발·라인업과 시즌 팀 및 선수 기록을 가져옵니다.</p></div></li>
-          <li><span>02</span><div><strong>설명 가능한 통계 추정</strong><p>팀 득점력·평균자책점·출루율, 예고 선발 ERA·WHIP과 홈 이점을 결합합니다.</p></div></li>
-          <li><span>03</span><div><strong>타석별 안타 확률 계산</strong><p>보정 시즌 타율, 상대 투수력과 타순별 예상 타수를 이용해 1안타 이상 확률을 구합니다.</p></div></li>
+          <li><span>01</span><div><strong>KBO 공식 기록·엔트리 수집</strong><p>일정·선발·라인업·1군 등록 명단과 시즌 기록을 가져옵니다.</p></div></li>
+          <li><span>02</span><div><strong>구장·날씨까지 통계 추정</strong><p>팀·선발·불펜 지표에 엔트리 이탈, 구장 득점 환경과 경기 시간 날씨를 결합합니다.</p></div></li>
+          <li><span>03</span><div><strong>역배 기대수익 검증</strong><p>시장의 마진을 제거한 확률과 모델 확률을 비교해 정배 대비 추가 기대수익을 계산합니다.</p></div></li>
         </ol>
       </section>
     </main>
 
     <footer>
       <div class="brand footer-brand"><span class="brand-mark">P</span><span>PLAYBALL</span></div>
-      <p>출처: KBO 공식 홈페이지 · 통계 추정치는 경기 결과를 보장하지 않습니다.</p>
+      <p>출처: KBO 공식 홈페이지 · <a href="https://open-meteo.com/" rel="noreferrer">Open-Meteo</a> · <a href="https://the-odds-api.com/" rel="noreferrer">The Odds API</a></p>
+      <p>통계·배당 추정치는 결과나 수익을 보장하지 않습니다.</p>
       <p>© 2026 PLAYBALL LAB</p>
     </footer>
 

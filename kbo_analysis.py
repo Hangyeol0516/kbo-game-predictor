@@ -28,16 +28,44 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 BASE_URL = "https://www.koreabaseball.com"
 KST = timezone(timedelta(hours=9))
 USER_AGENT = "PLAYBALL/0.1 (+personal KBO analysis prototype)"
+BASE_MODEL_VERSION = "stats-v5-context-value"
 TEAM_HITTER_1 = f"{BASE_URL}/Record/Team/Hitter/Basic1.aspx"
 TEAM_HITTER_2 = f"{BASE_URL}/Record/Team/Hitter/Basic2.aspx"
 TEAM_PITCHER_1 = f"{BASE_URL}/Record/Team/Pitcher/Basic1.aspx"
 PLAYER_HITTER_1 = f"{BASE_URL}/Record/Player/HitterBasic/Basic1.aspx"
 PLAYER_PITCHER_1 = f"{BASE_URL}/Record/Player/PitcherBasic/Basic1.aspx"
 PLAYER_HITTER_SITUATION = f"{BASE_URL}/Record/Player/HitterBasic/Situation.aspx"
+PLAYER_REGISTER_ALL = f"{BASE_URL}/Player/RegisterAll.aspx"
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/baseball_kbo/odds"
 
 TEAM_CODES = {
     "KT": "KT", "SS": "삼성", "LG": "LG", "HT": "KIA", "OB": "두산",
     "SK": "SSG", "HH": "한화", "LT": "롯데", "NC": "NC", "WO": "키움",
+}
+
+ODDS_TEAM_NAMES = {
+    "lg twins": "LG", "doosan bears": "두산", "hanwha eagles": "한화",
+    "samsung lions": "삼성", "kia tigers": "KIA", "lotte giants": "롯데",
+    "ssg landers": "SSG", "kt wiz": "KT", "nc dinos": "NC", "kiwoom heroes": "키움",
+    "lg 트윈스": "LG", "두산 베어스": "두산", "한화 이글스": "한화",
+    "삼성 라이온즈": "삼성", "kia 타이거즈": "KIA", "롯데 자이언츠": "롯데",
+    "ssg 랜더스": "SSG", "kt 위즈": "KT", "nc 다이노스": "NC", "키움 히어로즈": "키움",
+}
+
+# 좌표와 보수적인 득점 환경 사전계수. 실내 구장은 날씨 보정을 적용하지 않는다.
+PARKS = {
+    "잠실": {"lat": 37.5122, "lon": 127.0719, "runFactor": 0.94, "indoor": False},
+    "고척": {"lat": 37.4982, "lon": 126.8671, "runFactor": 0.98, "indoor": True},
+    "문학": {"lat": 37.4369, "lon": 126.6933, "runFactor": 1.03, "indoor": False},
+    "수원": {"lat": 37.2997, "lon": 127.0097, "runFactor": 1.03, "indoor": False},
+    "대전": {"lat": 36.3171, "lon": 127.4291, "runFactor": 1.02, "indoor": False},
+    "대구": {"lat": 35.8411, "lon": 128.6812, "runFactor": 1.06, "indoor": False},
+    "사직": {"lat": 35.1940, "lon": 129.0616, "runFactor": 0.97, "indoor": False},
+    "광주": {"lat": 35.1681, "lon": 126.8891, "runFactor": 1.00, "indoor": False},
+    "창원": {"lat": 35.2225, "lon": 128.5822, "runFactor": 0.98, "indoor": False},
+    "포항": {"lat": 36.0082, "lon": 129.3594, "runFactor": 1.00, "indoor": False},
+    "울산": {"lat": 35.5322, "lon": 129.2656, "runFactor": 1.00, "indoor": False},
 }
 
 POSITION_GROUPS = {
@@ -129,6 +157,12 @@ def _get_text(url: str, opener=None) -> str:
     return response.read().decode("utf-8")
 
 
+def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
+    request_headers = {"User-Agent": USER_AGENT, **(headers or {})}
+    with urlopen(Request(url, headers=request_headers), timeout=15) as response:
+        return json.loads(response.read())
+
+
 def _post_json(path: str, payload: dict[str, str]) -> Any:
     body = urlencode(payload).encode()
     request = Request(
@@ -171,6 +205,169 @@ def fetch_games(date: str) -> list[dict[str, Any]]:
         {"leId": "1", "srId": "0,1,3,4,5,6,7,8,9", "date": date.replace("-", "")},
     )
     return [game for game in raw.get("game", []) if int(game.get("LE_ID", 0)) == 1]
+
+
+def _parse_registered_players(rows: list[list[str]]) -> dict[str, set[str]]:
+    rosters: dict[str, set[str]] = {team: set() for team in TEAM_CODES.values()}
+    for row in rows:
+        if len(row) != 7:
+            continue
+        team = next((name for name in rosters if re.fullmatch(rf"{re.escape(name)}\d+명", row[0])), None)
+        if not team:
+            continue
+        for cell in row[3:]:
+            rosters[team].update(re.findall(r"([A-Za-z·.가-힣]+)\(\d+\)", cell))
+    return rosters
+
+
+def _parse_roster_movements(rows: list[list[str]]) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    sections: list[dict[str, list[str]]] = [defaultdict(list), defaultdict(list)]
+    section = -1
+    for row in rows:
+        if row == ["선수", "포지션", "팀"]:
+            section += 1
+        elif 0 <= section < 2 and len(row) == 3 and row[2] in TEAM_CODES.values():
+            sections[section][row[2]].append(row[0])
+    return dict(sections[0]), dict(sections[1])
+
+
+def fetch_roster_status(date: str) -> dict[str, Any]:
+    """KBO 공식 1군 엔트리와 당일 등록·말소 내역을 가져온다."""
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    current_html = _get_text(PLAYER_REGISTER_ALL, opener)
+    date_field = "ctl00$ctl00$ctl00$cphContents$cphContents$cphContents$hfSearchDate"
+    target = "ctl00$ctl00$ctl00$cphContents$cphContents$cphContents$btnSearch"
+    parser = FormParser()
+    parser.feed(current_html)
+    if parser.fields.get(date_field) != date.replace("-", ""):
+        current_html = _post_webform(
+            opener, PLAYER_REGISTER_ALL, current_html, target,
+            {date_field: date.replace("-", "")},
+        )
+    table_parser = TableParser()
+    table_parser.feed(current_html)
+    registered, deregistered = _parse_roster_movements(table_parser.rows)
+    return {
+        "active": _parse_registered_players(table_parser.rows),
+        "registeredToday": registered,
+        "deregisteredToday": deregistered,
+    }
+
+
+def _weather_run_factor(temperature: float | None) -> float:
+    if temperature is None:
+        return 1.0
+    return min(max(1 + (temperature - 20) * 0.003, 0.95), 1.05)
+
+
+def fetch_game_weather(game: dict[str, Any], date: str) -> dict[str, Any]:
+    park_name = game.get("S_NM", "")
+    park = PARKS.get(park_name, {"runFactor": 1.0, "indoor": False})
+    context = {
+        "available": False, "indoor": bool(park.get("indoor")), "temperature": None,
+        "humidity": None, "precipitationProbability": None, "windSpeed": None,
+        "parkRunFactor": float(park["runFactor"]), "weatherRunFactor": 1.0,
+    }
+    if context["indoor"]:
+        context.update({"available": True, "summary": "실내 구장 · 날씨 보정 없음"})
+        return context
+    if "lat" not in park:
+        context["summary"] = "구장 날씨 위치 미등록"
+        return context
+    query = urlencode({
+        "latitude": park["lat"], "longitude": park["lon"],
+        "hourly": "temperature_2m,relative_humidity_2m,precipitation_probability,wind_speed_10m",
+        "timezone": "Asia/Seoul", "start_date": date, "end_date": date,
+    })
+    try:
+        raw = _get_json(f"{OPEN_METEO_URL}?{query}")
+        hourly = raw["hourly"]
+        target = f"{date}T{str(game.get('G_TM') or '18:00')[:2]}:00"
+        index = min(range(len(hourly["time"])), key=lambda i: abs(datetime.fromisoformat(hourly["time"][i]).timestamp() - datetime.fromisoformat(target).timestamp()))
+        temperature = hourly["temperature_2m"][index]
+        context.update({
+            "available": True, "temperature": temperature,
+            "humidity": hourly["relative_humidity_2m"][index],
+            "precipitationProbability": hourly["precipitation_probability"][index],
+            "windSpeed": hourly["wind_speed_10m"][index],
+            "weatherRunFactor": _weather_run_factor(temperature),
+        })
+        context["summary"] = (
+            f"{temperature:.0f}℃ · 강수 {context['precipitationProbability']:.0f}% · "
+            f"바람 {context['windSpeed']:.0f}km/h"
+        )
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        context["summary"] = "날씨 정보 일시 미제공"
+    return context
+
+
+def fetch_game_weathers(games: list[dict[str, Any]], date: str) -> dict[str, dict[str, Any]]:
+    with ThreadPoolExecutor(max_workers=min(5, len(games))) as executor:
+        values = list(executor.map(lambda game: fetch_game_weather(game, date), games))
+    return {game["G_ID"]: value for game, value in zip(games, values)}
+
+
+def _odds_team_name(value: str) -> str | None:
+    normalized = " ".join(re.sub(r"[^a-z가-힣 ]", " ", value.lower()).split())
+    exact = ODDS_TEAM_NAMES.get(normalized)
+    if exact:
+        return exact
+    return next((team for alias, team in ODDS_TEAM_NAMES.items() if alias in normalized), None)
+
+
+def fetch_market_odds(date: str) -> dict[tuple[str, str], dict[str, Any]]:
+    """북메이커별 moneyline을 정규화하고 최고 배당과 무마진 합의확률을 만든다."""
+    api_key = os.environ.get("PLAYBALL_ODDS_API_KEY", "").strip()
+    if not api_key:
+        return {}
+    query = urlencode({
+        "apiKey": api_key, "regions": os.environ.get("PLAYBALL_ODDS_REGIONS", "eu,au"),
+        "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso",
+    })
+    raw = _get_json(f"{ODDS_API_URL}?{query}")
+    results: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in raw:
+        away, home = _odds_team_name(event.get("away_team", "")), _odds_team_name(event.get("home_team", ""))
+        if not away or not home:
+            continue
+        commence = event.get("commence_time", "")
+        try:
+            event_date = datetime.fromisoformat(commence.replace("Z", "+00:00")).astimezone(KST).date().isoformat()
+        except ValueError:
+            continue
+        if event_date != date:
+            continue
+        best: dict[str, dict[str, Any]] = {}
+        fair_samples: dict[str, list[float]] = {away: [], home: []}
+        last_update = None
+        for bookmaker in event.get("bookmakers", []):
+            market = next((item for item in bookmaker.get("markets", []) if item.get("key") == "h2h"), None)
+            if not market:
+                continue
+            prices = {}
+            for outcome in market.get("outcomes", []):
+                team = _odds_team_name(outcome.get("name", ""))
+                price = _number(str(outcome.get("price", 0)))
+                if team in fair_samples and price > 1:
+                    prices[team] = price
+                    if price > best.get(team, {}).get("price", 0):
+                        best[team] = {"price": price, "bookmaker": bookmaker.get("title") or bookmaker.get("key")}
+            if away in prices and home in prices:
+                raw_away, raw_home = 1 / prices[away], 1 / prices[home]
+                total = raw_away + raw_home
+                fair_samples[away].append(raw_away / total)
+                fair_samples[home].append(raw_home / total)
+                last_update = max(last_update or "", bookmaker.get("last_update") or "")
+        if away in best and home in best and fair_samples[away] and fair_samples[home]:
+            results[(away, home)] = {
+                "teams": {
+                    away: {**best[away], "marketProbability": statistics.median(fair_samples[away])},
+                    home: {**best[home], "marketProbability": statistics.median(fair_samples[home])},
+                },
+                "bookmakerCount": min(len(fair_samples[away]), len(fair_samples[home])),
+                "lastUpdate": last_update,
+            }
+    return results
 
 
 def fetch_lineup(game: dict[str, Any]) -> dict[str, Any]:
@@ -394,7 +591,10 @@ def load_calibrator() -> dict[str, Any] | None:
     try:
         with open(path, encoding="utf-8") as stream:
             calibrator = json.load(stream)
-        if calibrator.get("enabled") and calibrator.get("kind") == "platt":
+        if (
+            calibrator.get("enabled") and calibrator.get("kind") == "platt"
+            and calibrator.get("baseModelVersion") == BASE_MODEL_VERSION
+        ):
             return calibrator
     except (OSError, ValueError, TypeError):
         pass
@@ -411,9 +611,77 @@ def calibrate_probability(probability: float, calibrator: dict[str, Any] | None)
     return min(max(calibrated, 0.20), 0.80)
 
 
+def _availability_context(
+    team: str, hitter_stats: dict[tuple[str, str], dict[str, float]], roster_status: dict[str, Any],
+) -> dict[str, Any]:
+    active = roster_status.get("active", {}).get(team, set())
+    candidates = sorted(
+        ((name, stats) for (player_team, name), stats in hitter_stats.items() if player_team == team and stats.get("pa", 0) >= 50),
+        key=lambda item: item[1].get("pa", 0), reverse=True,
+    )[:6]
+    if not active or not candidates:
+        return {"available": False, "coreAbsent": [], "penalty": 0.0}
+    max_pa = max(stats["pa"] for _, stats in candidates)
+    absent = [
+        {"name": name, "pa": int(stats["pa"]), "avg": round(stats.get("avg", 0), 3)}
+        for name, stats in candidates if name not in active
+    ]
+    penalty = min(sum(0.012 + 0.018 * item["pa"] / max_pa for item in absent), 0.09)
+    return {
+        "available": True, "coreAbsent": absent, "penalty": penalty,
+        "registeredToday": roster_status.get("registeredToday", {}).get(team, []),
+        "deregisteredToday": roster_status.get("deregisteredToday", {}).get(team, []),
+    }
+
+
+def evaluate_value_bet(
+    away: str, home: str, away_probability: float, home_probability: float,
+    market: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not market:
+        return {"available": False, "recommendation": False, "reason": "배당 미연결"}
+    model = {away: away_probability, home: home_probability}
+    teams = market["teams"]
+    favorite = max((away, home), key=lambda team: teams[team]["marketProbability"])
+    underdog = home if favorite == away else away
+
+    def metrics(team: str) -> dict[str, Any]:
+        price = teams[team]["price"]
+        market_probability = teams[team]["marketProbability"]
+        expected_return = model[team] * price - 1
+        return {
+            "team": team, "modelProbability": round(model[team] * 100, 1),
+            "marketProbability": round(market_probability * 100, 1),
+            "edgePp": round((model[team] - market_probability) * 100, 1),
+            "odds": round(price, 2), "bookmaker": teams[team]["bookmaker"],
+            "expectedReturnPct": round(expected_return * 100, 1),
+        }
+
+    favorite_metrics, underdog_metrics = metrics(favorite), metrics(underdog)
+    advantage = underdog_metrics["expectedReturnPct"] - favorite_metrics["expectedReturnPct"]
+    min_ev = float(os.environ.get("PLAYBALL_UPSET_MIN_EV", "0.08")) * 100
+    min_edge = float(os.environ.get("PLAYBALL_UPSET_MIN_EDGE", "0.05")) * 100
+    min_advantage = float(os.environ.get("PLAYBALL_UPSET_MIN_ADVANTAGE", "0.10")) * 100
+    recommendation = (
+        underdog_metrics["expectedReturnPct"] >= min_ev
+        and underdog_metrics["edgePp"] >= min_edge
+        and advantage >= min_advantage
+    )
+    return {
+        "available": True, "recommendation": recommendation,
+        "favorite": favorite_metrics, "underdog": underdog_metrics,
+        "returnAdvantagePp": round(advantage, 1),
+        "bookmakerCount": market.get("bookmakerCount", 0),
+        "lastUpdate": market.get("lastUpdate"),
+        "criterion": {"minimumEvPct": min_ev, "minimumEdgePp": min_edge, "minimumAdvantagePp": min_advantage},
+    }
+
+
 def _game_prediction(
     game: dict[str, Any], team_stats: dict[str, dict[str, float]],
     pitcher_stats: dict[tuple[str, str], dict[str, float]], bullpen_stats: dict[str, dict[str, Any]],
+    hitter_stats: dict[tuple[str, str], dict[str, float]], roster_status: dict[str, Any],
+    weather: dict[str, Any], market_odds: dict[str, Any] | None,
     calibrator: dict[str, Any] | None,
 ) -> dict[str, Any]:
     away_name, home_name = game["AWAY_NM"], game["HOME_NM"]
@@ -444,13 +712,17 @@ def _game_prediction(
     fatigue_mean, fatigue_std = _mean_std([float(team["fatigueScore"]) for team in bullpen_stats.values()])
     away_fatigue = (bullpen_stats[away_name]["fatigueScore"] - fatigue_mean) / fatigue_std
     home_fatigue = (bullpen_stats[home_name]["fatigueScore"] - fatigue_mean) / fatigue_std
+    away_availability = _availability_context(away_name, hitter_stats, roster_status)
+    home_availability = _availability_context(home_name, hitter_stats, roster_status)
+    run_environment = weather["parkRunFactor"] * weather["weatherRunFactor"]
     home_logit = (
-        0.13 + 0.50 * (rating(home) - rating(away))
+        0.13 + 0.50 * run_environment * (rating(home) - rating(away))
         + 0.20 * (home_starter_rating - away_starter_rating)
         + 0.10 * (away_fatigue - home_fatigue)
+        + away_availability["penalty"] - home_availability["penalty"]
     )
     home_probability = 1 / (1 + math.exp(-home_logit))
-    # 부상·구장·날씨 변수를 아직 반영하지 않는 v4이므로 과신을 막는다.
+    # 보정 전 설명형 추정치의 과신을 막는다.
     home_probability = min(max(home_probability, 0.28), 0.72)
     raw_home_probability = home_probability
     home_probability = calibrate_probability(home_probability, calibrator)
@@ -459,20 +731,32 @@ def _game_prediction(
     pick = home_name if home_percent >= away_percent else away_name
     margin = abs(home_percent - away_percent)
     confidence = "높음" if margin >= 20 else "보통" if margin >= 10 else "접전"
+    if (weather.get("precipitationProbability") or 0) >= 60:
+        confidence = "날씨 변수"
     better_offense = home_name if home["runs_per_game"] > away["runs_per_game"] else away_name
     better_pitching = home_name if home["era"] < away["era"] else away_name
 
+    value_bet = evaluate_value_bet(
+        away_name, home_name, away_probability=away_percent / 100,
+        home_probability=home_percent / 100, market=market_odds,
+    )
+    away_absent = ", ".join(item["name"] for item in away_availability["coreAbsent"]) or "없음"
+    home_absent = ", ".join(item["name"] for item in home_availability["coreAbsent"]) or "없음"
     return {
         "id": game["G_ID"], "time": game["G_TM"], "park": game["S_NM"],
         "away": away_name, "home": home_name,
         "awayPitcher": away_pitcher_name or "미정", "homePitcher": home_pitcher_name or "미정",
         "awayProb": away_percent, "homeProb": home_percent, "pick": pick, "confidence": confidence,
         "lineupConfirmed": bool(game.get("LINEUP_CK")),
+        "weather": weather, "availability": {"away": away_availability, "home": home_availability},
+        "valueBet": value_bet,
         "reasons": [
             f"{better_offense} 시즌 득점력 우위 ({team_stats[better_offense]['runs_per_game']:.2f}점/경기)",
             f"{better_pitching} 팀 평균자책점 우위 ({team_stats[better_pitching]['era']:.2f})",
             f"선발 ERA: {away_name} {away_starter.get('era', away['era']):.2f} · {home_name} {home_starter.get('era', home['era']):.2f}",
             f"최근 3일 불펜 투구: {away_name} {bullpen_stats[away_name]['pitches']}구 · {home_name} {bullpen_stats[home_name]['pitches']}구",
+            f"1군 엔트리 이탈 핵심 타자(부상 확정 아님): {away_name} {away_absent} · {home_name} {home_absent}",
+            f"{game['S_NM']} 득점환경 계수 {run_environment:.2f} · {weather['summary']}",
             f"{away_name} 출루율 {away['obp']:.3f} · {home_name} 출루율 {home['obp']:.3f}",
             "홈 경기 기본 보정 3.2% 적용",
         ],
@@ -484,6 +768,9 @@ def _game_prediction(
             "homeBullpenPitches3d": bullpen_stats[home_name]["pitches"],
             "awayBackToBackRelievers": bullpen_stats[away_name]["backToBack"],
             "homeBackToBackRelievers": bullpen_stats[home_name]["backToBack"],
+            "awayAvailabilityPenalty": round(away_availability["penalty"], 4),
+            "homeAvailabilityPenalty": round(home_availability["penalty"], 4),
+            "runEnvironmentFactor": round(run_environment, 4),
             "rawHomeProbability": round(raw_home_probability, 4),
             "calibrated": bool(calibrator),
         },
@@ -496,6 +783,7 @@ def _hitter_predictions(
     pitcher_stats: dict[tuple[str, str], dict[str, float]],
     pitcher_hands: dict[str, dict[str, str]],
     matchup_hitter_stats: dict[tuple[str, str, str], dict[str, float]],
+    roster_status: dict[str, Any],
 ) -> tuple[dict[str, list[dict[str, Any]]], bool]:
     league_avg = statistics.mean(team["avg"] for team in team_stats.values())
     league_era, league_era_std = _mean_std([team["era"] for team in team_stats.values()])
@@ -507,6 +795,9 @@ def _hitter_predictions(
         all_confirmed = all_confirmed and lineup["confirmed"]
         for side, opponent in (("away", game["HOME_NM"]), ("home", game["AWAY_NM"])):
             for player in lineup[side]:
+                active = roster_status.get("active", {}).get(player["team"], set())
+                if not lineup["confirmed"] and active and player["name"] not in active:
+                    continue
                 stats = hitter_stats.get((player["team"], player["name"]), {})
                 ab, hits = stats.get("ab", 0), stats.get("hits", 0)
                 pa_average = (hits + 60 * league_avg) / (ab + 60)
@@ -563,9 +854,14 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
 
     games = fetch_games(date)
     calibrator = load_calibrator()
-    method_version = "stats-v4-matchup+platt-v1" if calibrator else "stats-v4-matchup"
+    method_version = f"{BASE_MODEL_VERSION}+platt-v1" if calibrator else BASE_MODEL_VERSION
     if not games:
-        result = {"date": date, "games": [], "hitters": {}, "updatedAt": datetime.now(KST).isoformat(timespec="seconds"), "source": "KBO 공식 홈페이지", "methodVersion": method_version, "snapshotEligible": False}
+        result = {
+            "date": date, "games": [], "hitters": {}, "updatedAt": datetime.now(KST).isoformat(timespec="seconds"),
+            "source": "KBO 공식 홈페이지", "sources": ["KBO 공식 홈페이지", "Open-Meteo"],
+            "methodVersion": method_version, "valueBetStatus": "not-configured" if not os.environ.get("PLAYBALL_ODDS_API_KEY") else "no-market",
+            "valueBets": [], "snapshotEligible": False,
+        }
     else:
         team_stats = fetch_team_stats()
         relevant_team_ids = list(dict.fromkeys([code for game in games for code in (game["AWAY_ID"], game["HOME_ID"])]))
@@ -575,29 +871,60 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
         for game in games:
             team_splits[team_id_by_name[game["AWAY_NM"]]] = pitcher_hands[game["HOME_NM"]]["split"]
             team_splits[team_id_by_name[game["HOME_NM"]]] = pitcher_hands[game["AWAY_NM"]]["split"]
-        with ThreadPoolExecutor(max_workers=max(2, min(7, len(games) + 3))) as executor:
+        with ThreadPoolExecutor(max_workers=max(4, min(10, len(games) + 6))) as executor:
             lineup_futures = [executor.submit(fetch_lineup, game) for game in games]
             hitter_future = executor.submit(fetch_hitter_stats, relevant_team_ids)
             pitcher_future = executor.submit(fetch_pitcher_stats, relevant_team_ids)
             bullpen_future = executor.submit(fetch_recent_bullpen, date, [TEAM_CODES[team_id] for team_id in relevant_team_ids])
             matchup_future = executor.submit(fetch_matchup_hitter_stats, team_splits)
+            roster_future = executor.submit(fetch_roster_status, date)
+            weather_future = executor.submit(fetch_game_weathers, games, date)
+            odds_future = executor.submit(fetch_market_odds, date)
             lineup_results = [future.result() for future in lineup_futures]
             hitter_stats = hitter_future.result()
             pitcher_stats = pitcher_future.result()
             bullpen_stats = bullpen_future.result()
             matchup_hitter_stats = matchup_future.result()
+            try:
+                roster_status = roster_future.result()
+            except Exception:
+                roster_status = {"active": {}, "registeredToday": {}, "deregisteredToday": {}}
+            try:
+                weather_by_game = weather_future.result()
+            except Exception:
+                weather_by_game = {
+                    game["G_ID"]: {
+                        "available": False, "indoor": False, "temperature": None, "humidity": None,
+                        "precipitationProbability": None, "windSpeed": None, "parkRunFactor": 1.0,
+                        "weatherRunFactor": 1.0, "summary": "날씨 정보 일시 미제공",
+                    } for game in games
+                }
+            try:
+                market_odds = odds_future.result()
+            except Exception:
+                market_odds = {}
         lineups = {game["G_ID"]: lineup for game, lineup in zip(games, lineup_results)}
-        game_predictions = [_game_prediction(game, team_stats, pitcher_stats, bullpen_stats, calibrator) for game in games]
+        game_predictions = [
+            _game_prediction(
+                game, team_stats, pitcher_stats, bullpen_stats, hitter_stats, roster_status,
+                weather_by_game[game["G_ID"]], market_odds.get((game["AWAY_NM"], game["HOME_NM"])), calibrator,
+            )
+            for game in games
+        ]
         hitter_predictions, all_confirmed = _hitter_predictions(
-            games, lineups, hitter_stats, team_stats, pitcher_stats, pitcher_hands, matchup_hitter_stats,
+            games, lineups, hitter_stats, team_stats, pitcher_stats, pitcher_hands, matchup_hitter_stats, roster_status,
         )
+        value_available = any(game["valueBet"]["available"] for game in game_predictions)
         result = {
             "date": date, "games": game_predictions, "hitters": hitter_predictions,
             "lineupStatus": "confirmed" if all_confirmed else "projected",
             "updatedAt": datetime.now(KST).isoformat(timespec="seconds"),
-            "source": "KBO 공식 홈페이지", "methodVersion": method_version,
+            "source": "KBO 공식 홈페이지", "sources": ["KBO 공식 홈페이지", "Open-Meteo"] + (["The Odds API"] if value_available else []),
+            "methodVersion": method_version,
+            "valueBetStatus": "connected" if value_available else ("no-market" if os.environ.get("PLAYBALL_ODDS_API_KEY") else "not-configured"),
+            "valueBets": [game["valueBet"] | {"gameId": game["id"], "away": game["away"], "home": game["home"]} for game in game_predictions if game["valueBet"].get("recommendation")],
             "snapshotEligible": all(str(game.get("GAME_STATE_SC")) == "1" and not bool(game.get("GAME_RESULT_CK")) for game in games),
-            "disclaimer": "공식 기록을 사용한 설명형 통계 추정치이며, 학습·백테스트된 예측 모델의 결과가 아닙니다.",
+            "disclaimer": "공식 기록을 사용한 설명형 통계 추정치이며, 배당 기대수익은 수익을 보장하지 않습니다.",
         }
 
     with _cache_lock:

@@ -136,6 +136,27 @@ main { overflow: hidden; }
 .game-card.open .reason-toggle span { transform: rotate(180deg); }
 .reasons { display: none; margin: 0; padding: 2px 25px 18px 39px; color: #5f625f; font-size: 11px; line-height: 1.8; }
 .game-card.open .reasons { display: block; }
+.game-card.value-pick { border-color: var(--orange); box-shadow: 0 4px 0 rgba(255,107,53,.12); }
+.game-card.value-pick .game-meta strong { color: #b43d16; }
+
+.value-section { max-width: none; padding-left: max(24px, calc((100vw - 1200px) / 2)); padding-right: max(24px, calc((100vw - 1200px) / 2)); background: #101c17; color: white; }
+.value-section .section-kicker { color: var(--orange); }
+.value-section .section-description, .value-section .ranking-unit { color: #89948e; }
+.value-content { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.value-empty { color: #89948e; border-color: #385046; }
+.value-empty strong { color: white; }
+.value-empty code { margin: 0 5px; color: var(--green); font: 600 11px "IBM Plex Mono", monospace; }
+.value-card { border: 1px solid #3b4e46; border-radius: 11px; background: #17251f; overflow: hidden; }
+.value-card-head { padding: 14px 18px; display: flex; justify-content: space-between; gap: 15px; background: #213129; color: #9aaaa2; font-size: 11px; }
+.value-card-head strong { color: #ff8a65; }
+.value-metrics { padding: 18px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.value-metrics div { min-width: 0; padding: 12px; border: 1px solid #30443a; border-radius: 7px; }
+.value-metrics div.primary { border-color: rgba(49,220,120,.55); background: rgba(49,220,120,.07); }
+.value-metrics small, .value-metrics span { display: block; color: #839088; font-size: 9px; }
+.value-metrics b { display: block; margin: 8px 0 5px; color: white; font: 600 20px "IBM Plex Mono", monospace; }
+.value-metrics .primary b { color: var(--green); }
+.value-card > p { margin: 0; padding: 0 18px 18px; color: #8d9b94; font-size: 10px; }
+.value-card > p strong { color: white; }
 
 .hitters-section { max-width: none; padding-left: max(24px, calc((100vw - 1200px) / 2)); padding-right: max(24px, calc((100vw - 1200px) / 2)); background: #e7e4da; }
 .hitters-heading { max-width: 1200px; margin-left: auto; margin-right: auto; }
@@ -221,6 +242,7 @@ footer { min-height: 110px; padding: 25px max(24px, calc((100vw - 1200px) / 2));
   .section-heading { align-items: flex-start; gap: 20px; }
   .status-legend { margin-top: 10px; max-width: 110px; line-height: 1.5; }
   .game-grid { grid-template-columns: 1fr; }
+  .value-content { grid-template-columns: 1fr; }
   .hitter-content { grid-template-columns: 1fr; }
   .performance-content { grid-template-columns: 1fr; }
   .method-section { padding: 65px 20px; grid-template-columns: 1fr; gap: 45px; }
@@ -243,6 +265,7 @@ footer { min-height: 110px; padding: 25px max(24px, calc((100vw - 1200px) / 2));
   .probability-ring strong { font-size: 25px; }
   .hitter-name { font-size: 33px; }
   .metric-grid { grid-template-columns: 1fr; }
+  .value-metrics { grid-template-columns: repeat(2, 1fr); }
   .metric-grid article { min-height: 105px; }
   .result-row { grid-template-columns: 1fr auto; }
   .result-row time { grid-column: 1 / -1; }

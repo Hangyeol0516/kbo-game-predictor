@@ -16,7 +16,7 @@ class CalibrationTest(unittest.TestCase):
         self.assertLess(brier(calibrated, outcomes), brier(probabilities, outcomes))
 
     def test_runtime_calibration_is_bounded(self):
-        calibrator = {"enabled": True, "kind": "platt", "slope": 3.0, "intercept": 0.0}
+        calibrator = {"enabled": True, "kind": "platt", "baseModelVersion": "stats-v5-context-value", "slope": 3.0, "intercept": 0.0}
         self.assertEqual(calibrate_probability(0.99, calibrator), 0.8)
         self.assertEqual(calibrate_probability(0.01, calibrator), 0.2)
 

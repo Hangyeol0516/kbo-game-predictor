@@ -25,6 +25,7 @@ function teamBlock(code, pitcher) {
 function renderLoading() {
   document.querySelector("#gameGrid").innerHTML = `<div class="empty-state loading-state"><strong>공식 기록을 분석하고 있습니다.</strong>일정·팀 기록·라인업을 불러오는 데 몇 초 정도 걸릴 수 있습니다.</div>`;
   document.querySelector("#hitterContent").innerHTML = `<div class="empty-state"><strong>선수 매치업 계산 중</strong>KBO 라인업과 시즌 기록을 결합하고 있습니다.</div>`;
+  document.querySelector("#valueContent").innerHTML = `<div class="empty-state"><strong>역배 기대수익 계산 중</strong>모델 승률과 시장 배당을 대조하고 있습니다.</div>`;
   document.querySelector("#dataNotice").innerHTML = `<span>LIVE</span> KBO 공식 데이터를 불러오는 중입니다.`;
   document.querySelector("#liveStatus").innerHTML = `<i></i> 분석 중`;
 }
@@ -33,6 +34,7 @@ function renderError(message) {
   const markup = `<div class="empty-state error-state"><strong>데이터를 불러오지 못했습니다.</strong>${message}<br><button type="button" id="retryButton" class="retry-button">다시 시도</button></div>`;
   document.querySelector("#gameGrid").innerHTML = markup;
   document.querySelector("#hitterContent").innerHTML = `<div class="empty-state"><strong>선수 예측을 표시할 수 없습니다.</strong>실제 데이터가 없을 때는 샘플 값을 대신 보여주지 않습니다.</div>`;
+  document.querySelector("#valueContent").innerHTML = `<div class="empty-state"><strong>배당 가치를 표시할 수 없습니다.</strong>불완전한 데이터로 역배를 추천하지 않습니다.</div>`;
   document.querySelector("#liveStatus").innerHTML = `<i></i> 연결 오류`;
   document.querySelector("#retryButton")?.addEventListener("click", () => loadAnalysis(true));
 }
@@ -45,8 +47,8 @@ function renderGames() {
     return;
   }
   grid.innerHTML = games.map((game, index) => `
-    <article class="game-card">
-      <div class="game-meta"><span>${game.time} · ${game.park} 야구장</span><strong>GAME ${pad(index + 1)}</strong></div>
+    <article class="game-card ${game.valueBet?.recommendation ? "value-pick" : ""}">
+      <div class="game-meta"><span>${game.time} · ${game.park} 야구장 · ${game.weather?.summary || "날씨 미제공"}</span><strong>${game.valueBet?.recommendation ? "역배 EV+" : `GAME ${pad(index + 1)}`}</strong></div>
       <div class="matchup">${teamBlock(game.away, game.awayPitcher)}<div class="prediction"><small>STATS PICK</small><strong>${game.pick}</strong><span>${game.confidence}</span></div>${teamBlock(game.home, game.homePitcher)}</div>
       <div class="probability-row"><b>${game.awayProb}%</b><div class="probability-track"><i style="width:${game.awayProb}%"></i><i style="width:${game.homeProb}%"></i></div><b>${game.homeProb}%</b></div>
       <button class="reason-toggle" type="button" aria-expanded="false">실제 지표와 계산 근거 보기 <span>⌄</span></button>
@@ -56,6 +58,44 @@ function renderGames() {
     const card = button.closest(".game-card"); card.classList.toggle("open");
     button.setAttribute("aria-expanded", card.classList.contains("open"));
   }));
+}
+
+function signed(value, suffix = "%") {
+  return `${value > 0 ? "+" : ""}${value}${suffix}`;
+}
+
+function renderValueBets() {
+  const container = document.querySelector("#valueContent");
+  const games = state.data?.games || [];
+  const available = games.filter(game => game.valueBet?.available);
+  const picks = available.filter(game => game.valueBet.recommendation);
+  if (state.data?.valueBetStatus === "not-configured") {
+    container.innerHTML = `<div class="empty-state value-empty"><strong>배당 API가 아직 연결되지 않았습니다.</strong><code>PLAYBALL_ODDS_API_KEY</code>를 설정하면 실제 KBO 배당으로 역배 EV를 계산합니다. 배당 없이는 역배를 추천하지 않습니다.</div>`;
+    return;
+  }
+  if (!available.length) {
+    container.innerHTML = `<div class="empty-state value-empty"><strong>이 날짜의 사전 배당이 없습니다.</strong>배당 시장이 열리지 않았거나 이미 마감된 경기입니다.</div>`;
+    return;
+  }
+  if (!picks.length) {
+    container.innerHTML = `<div class="empty-state value-empty"><strong>정배를 포기할 만한 역배가 없습니다.</strong>역배 EV +8%, 시장 대비 엣지 +5%p, 정배 대비 EV 우위 +10%p를 모두 넘지 못했습니다.</div>`;
+    return;
+  }
+  container.innerHTML = picks.map(game => {
+    const value = game.valueBet;
+    const dog = value.underdog;
+    const favorite = value.favorite;
+    return `<article class="value-card">
+      <div class="value-card-head"><span>${game.away} @ ${game.home}</span><strong>역배 PICK · ${dog.team}</strong></div>
+      <div class="value-metrics">
+        <div><small>최고 배당</small><b>${dog.odds.toFixed(2)}</b><span>${dog.bookmaker}</span></div>
+        <div><small>모델 / 시장</small><b>${dog.modelProbability}%</b><span>${dog.marketProbability}% · 엣지 ${signed(dog.edgePp, "%p")}</span></div>
+        <div class="primary"><small>역배 기대수익</small><b>${signed(dog.expectedReturnPct)}</b><span>1만원당 기대 ${signed(Math.round(dog.expectedReturnPct * 100), "원")}</span></div>
+        <div><small>정배 기대수익</small><b>${signed(favorite.expectedReturnPct)}</b><span>${favorite.team} @ ${favorite.odds.toFixed(2)}</span></div>
+      </div>
+      <p>정배 대비 기대수익 우위 <strong>${signed(value.returnAdvantagePp, "%p")}</strong> · ${value.bookmakerCount}개 북메이커 비교</p>
+    </article>`;
+  }).join("");
 }
 
 function renderFilters() {
@@ -86,10 +126,10 @@ function renderHitters() {
 }
 
 function renderAnalysis() {
-  renderGames(); renderFilters(); renderHitters();
+  renderGames(); renderValueBets(); renderFilters(); renderHitters();
   const status = state.data.lineupStatus === "confirmed" ? "확정 라인업 반영" : "최근 라인업 기준";
   document.querySelector("#lineupLegend").innerHTML = `<i></i> ${status}`;
-  document.querySelector("#dataNotice").innerHTML = `<span>OFFICIAL DATA</span> 출처: KBO 공식 홈페이지 · ${formatUpdated(state.data.updatedAt)} 갱신 · ${state.data.methodVersion}`;
+  document.querySelector("#dataNotice").innerHTML = `<span>LIVE DATA</span> 출처: ${(state.data.sources || [state.data.source]).join(" · ")} · ${formatUpdated(state.data.updatedAt)} 갱신 · ${state.data.methodVersion}`;
   document.querySelector("#liveStatus").innerHTML = `<i></i> ${formatUpdated(state.data.updatedAt)} 갱신`;
 }
 
@@ -100,6 +140,7 @@ async function loadPerformance() {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "성능 정보를 불러오지 못했습니다.");
     const metric = (value, suffix = "") => value === null ? "—" : `${value}${suffix}`;
+    const value = data.valueBet || { recommended: 0, settled: 0, wins: 0, roi: null, profitUnits: 0 };
     const recent = data.recent.length ? `<div class="performance-history"><h3>최근 채점 결과</h3>${data.recent.map(game => `
       <article class="result-row">
         <time>${game.date}</time><div><strong>${game.away} ${game.score} ${game.home}</strong><span>예측 ${game.pick} · 승리 ${game.winner}</span></div>
@@ -109,6 +150,8 @@ async function loadPerformance() {
       <article><span>평가 경기</span><strong>${data.evaluatedGames}</strong><small>GAMES</small></article>
       <article><span>승패 적중률</span><strong>${metric(data.accuracy, "%")}</strong><small>${data.correctGames} / ${data.decidedGames}</small></article>
       <article><span>Brier Score</span><strong>${metric(data.brierScore)}</strong><small>낮을수록 정확</small></article>
+      <article><span>역배 추천 / 적중</span><strong>${value.recommended} / ${value.wins}</strong><small>${value.settled}건 정산</small></article>
+      <article><span>역배 실현 ROI</span><strong>${metric(value.roi, "%")}</strong><small>${signed(value.profitUnits, " units")}</small></article>
     </div>${recent}`;
   } catch (error) {
     container.innerHTML = `<div class="empty-state error-state"><strong>성능 정보를 표시할 수 없습니다.</strong>${error.message}</div>`;

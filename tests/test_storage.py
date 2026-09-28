@@ -22,6 +22,15 @@ class PredictionStoreTest(unittest.TestCase):
             "games": [{
                 "id": "20260401LGOB0", "away": "LG", "home": "두산",
                 "awayProb": 40, "homeProb": 60, "pick": "두산",
+                "valueBet": {
+                    "available": True, "recommendation": True, "returnAdvantagePp": 15.0,
+                    "favorite": {"team": "두산"},
+                    "underdog": {
+                        "team": "LG", "odds": 2.8, "modelProbability": 40.0,
+                        "marketProbability": 34.0, "expectedReturnPct": 12.0,
+                        "bookmaker": "Test Book",
+                    },
+                },
             }],
         }
         with patch("storage.datetime") as mocked_datetime:
@@ -37,6 +46,9 @@ class PredictionStoreTest(unittest.TestCase):
         self.assertEqual(summary["evaluatedGames"], 1)
         self.assertEqual(summary["accuracy"], 100.0)
         self.assertEqual(summary["brierScore"], 0.16)
+        self.assertEqual(summary["valueBet"]["settled"], 1)
+        self.assertEqual(summary["valueBet"]["wins"], 0)
+        self.assertEqual(summary["valueBet"]["roi"], -100.0)
 
 
 if __name__ == "__main__":
