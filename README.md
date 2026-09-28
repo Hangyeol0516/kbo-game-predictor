@@ -1,43 +1,63 @@
-# PLAYBALL — KBO 예측 앱 프로토타입
+# PLAYBALL — KBO 경기·역배 가치 분석
 
-KBO 당일 경기 승률, 포지션별 1안타 이상 확률, 실제 배당 기준 역배 기대수익을 보여주는 프로토타입입니다. 일정, 예고 선발, 라인업, 1군 엔트리와 시즌 기록은 KBO 공식 홈페이지에서 가져옵니다.
+[![Container image](https://github.com/Hangyeol0516/kbo-game-predictor/actions/workflows/container.yml/badge.svg)](https://github.com/Hangyeol0516/kbo-game-predictor/actions/workflows/container.yml)
 
-## 권장 배포: 완성 이미지 받기
+KBO 당일 경기 승률, 포지션별 1안타 이상 확률, 실제 moneyline 배당 기준 역배 기대수익을 한 화면에서 보여주는 설명형 통계 분석 앱입니다.
 
-GitHub Container Registry에서 완성된 이미지를 받아 앱 컨테이너 하나와 영속 데이터 볼륨을 실행합니다. 배포 서버에서 빌드할 필요가 없으며 PostgreSQL 컨테이너도 필요하지 않습니다. 이미지는 Python Alpine 기반이며 실행에 필요한 파일만 담습니다.
+일정·예고 선발·라인업·1군 엔트리·시즌 기록은 KBO 공식 홈페이지, 날씨는 Open-Meteo, 배당은 The Odds API를 사용합니다. 배당 API가 없어도 경기와 타자 분석은 정상 작동합니다.
+
+## 현재 상태
+
+- `linux/amd64`, `linux/arm64`용 완성 이미지를 GHCR에 자동 배포
+- Python Alpine 기반 단일 앱 컨테이너로 구성
+- AMD64 로컬 기준 약 18.1MB 이미지(환경에 따라 달라질 수 있음)
+- 외부 Python 패키지와 별도 데이터베이스 컨테이너 불필요
+- SQLite 데이터와 확률 보정 파일을 Docker 볼륨에 영속화
+- 비루트 사용자 `10001`로 실행
+- `.env`, 소스, Git 메타데이터와 SQLite 파일의 HTTP 접근 차단
+- 커밋별 테스트, 멀티아키텍처 빌드, SBOM과 이미지 출처 증명 자동 생성
+
+## 가장 빠른 실행
 
 ```bash
 git clone https://github.com/Hangyeol0516/kbo-game-predictor.git
 cd kbo-game-predictor
-docker compose up -d
-```
-
-역배 EV는 The Odds API의 KBO moneyline 배당을 사용합니다. API 키가 없으면 예측은 정상 작동하지만 역배를 추천하지 않습니다.
-
-```bash
 cp .env.example .env
-# .env에 PLAYBALL_ODDS_API_KEY 입력
+# .env에 PLAYBALL_ODDS_API_KEY 입력(역배 분석을 사용하지 않으면 비워도 됨)
 docker compose up -d
 ```
 
-기본 역배 추천 기준은 EV 8%, 시장 대비 엣지 5%p, 정배 대비 EV 우위 10%p입니다. 추천하지 않는 경기에도 실제 수치와 미달 기준을 함께 표시하므로, 왜 정배를 포기하지 않았는지 확인할 수 있습니다. `.env.example`의 세 임계값으로 조정할 수 있습니다.
-
-무료 배당 쿼터를 아끼기 위해 기본 지역은 `eu` 한 곳이며 응답 전체를 1시간 캐시합니다. `PLAYBALL_ODDS_REGIONS`에 지역을 추가하면 요청 비용도 늘어날 수 있습니다. 캐시 시간은 `PLAYBALL_ODDS_CACHE_SECONDS`로 조정합니다.
-
-브라우저에서 <http://localhost:8000>을 엽니다. 포트를 바꾸려면 `PLAYBALL_PORT=8080 docker compose up -d`처럼 실행합니다.
-
-업데이트와 로그 확인:
+브라우저에서 <http://localhost:8000>을 엽니다.
 
 ```bash
-git pull
-docker compose pull
-docker compose up -d
-docker compose logs -f
+# 상태 확인
+curl -fsS http://localhost:8000/health
+
+# 로그 확인
+docker compose logs -f playball
 ```
 
-`latest` 대신 특정 이미지 태그를 고정하려면 `PLAYBALL_IMAGE_TAG`를 지정합니다. `sha-<Git 커밋 앞 7자리>` 태그가 커밋마다 자동 생성됩니다.
+포트를 변경하려면 다음처럼 실행합니다.
 
-Compose 없이 Docker만 사용할 수도 있습니다.
+```bash
+PLAYBALL_PORT=8080 docker compose up -d
+```
+
+## 업데이트
+
+```bash
+git pull --ff-only
+docker compose pull
+docker compose up -d --remove-orphans
+```
+
+`latest` 대신 특정 커밋 이미지를 고정하려면 `.env`에 다음 값을 추가합니다. 각 커밋에는 `sha-<앞 7자리>` 태그가 생성됩니다.
+
+```dotenv
+PLAYBALL_IMAGE_TAG=sha-24ffb59
+```
+
+## Compose 없이 실행
 
 ```bash
 docker pull ghcr.io/hangyeol0516/kbo-game-predictor:latest
@@ -50,7 +70,77 @@ docker run -d \
   ghcr.io/hangyeol0516/kbo-game-predictor:latest
 ```
 
-컨테이너는 비루트 사용자로 실행되며 `/health`에서 수집기 상태, 배당 연결 상태와 남은 API 요청량을 확인합니다. 예측 스냅샷은 `playball_data` 볼륨에 보존됩니다. 웹 서버는 화면에 필요한 정적 파일만 공개하며 `.env`, 데이터베이스와 소스 파일은 제공하지 않습니다.
+## 역배 판단 기준
+
+핵심 질문은 **“정배를 포기하고 역배를 선택했을 때 추가 리턴이 충분한가?”**입니다.
+
+```text
+역배 기대수익(EV) = 모델 승률 × decimal 배당 - 1
+시장 대비 엣지     = 모델 승률 - 무마진 시장확률
+정배 대비 EV 우위  = 역배 EV - 정배 EV
+```
+
+기본적으로 다음 세 조건을 모두 충족할 때만 `역배 PICK`으로 표시합니다.
+
+| 조건 | 기본값 |
+| --- | ---: |
+| 역배 기대수익 | 8% 이상 |
+| 시장 대비 모델 엣지 | 5%p 이상 |
+| 정배 대비 기대수익 우위 | 10%p 이상 |
+
+조건을 통과하지 못한 경기도 숨기지 않고 `NO BET`과 미달 기준을 표시합니다. 배당이 없거나 제공사 오류가 발생하면 임의의 값이나 오래된 배당으로 역배를 추천하지 않습니다.
+
+## 환경 변수
+
+| 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `PLAYBALL_ODDS_API_KEY` | 비어 있음 | The Odds API 키. 비어 있으면 역배 추천 비활성화 |
+| `PLAYBALL_ODDS_REGIONS` | `eu` | 조회할 북메이커 지역. 지역 수가 늘면 API 비용도 증가 가능 |
+| `PLAYBALL_ODDS_CACHE_SECONDS` | `3600` | 배당 전체 응답 캐시 시간. 최소 300초 |
+| `PLAYBALL_UPSET_MIN_EV` | `0.08` | 역배 최소 기대수익 |
+| `PLAYBALL_UPSET_MIN_EDGE` | `0.05` | 시장 대비 최소 확률 엣지 |
+| `PLAYBALL_UPSET_MIN_ADVANTAGE` | `0.10` | 정배 대비 최소 EV 우위 |
+| `PLAYBALL_PORT` | `8000` | 호스트에 공개할 포트 |
+| `PLAYBALL_IMAGE_TAG` | `latest` | 실행할 GHCR 이미지 태그 |
+
+무료 API 쿼터를 보호하기 위해 기본 지역은 한 곳이며, 한 번 받은 전체 KBO 배당을 1시간 공유합니다. `/health`에서 마지막 요청 시각, 오류, 이벤트 수와 제공사가 반환한 요청량 정보를 확인할 수 있습니다. API 키 자체는 응답이나 로그에 노출하지 않습니다.
+
+## 제공 기능
+
+- 날짜별 KBO 공식 일정과 예고 선발 조회
+- 팀 득점력·ERA·출루율을 이용한 경기 승률
+- 선발 ERA·WHIP과 최근 3일 불펜 투구량 반영
+- 1군 엔트리 이탈, 구장 득점 계수와 경기 시간 날씨 반영
+- 좌투·우투·언더 유형별 타격 스플릿 기반 1안타 이상 확률
+- 실제 배당의 무마진 시장확률과 모델 확률 비교
+- 경기별 `역배 PICK / NO BET` 및 탈락 기준 표시
+- 예측 시점별 SQLite 스냅샷과 경기 종료 후 자동 채점
+- 적중률, Brier Score, 역배 실현 ROI 표시
+- 시간순 백테스트 데이터 내보내기
+- 검증 성능이 개선될 때만 활성화되는 Platt 확률 보정기
+
+## 데이터 흐름
+
+```text
+KBO 공식 기록 ─┐
+Open-Meteo ────┼─> 통계 추정·확률 보정 ─> 웹 화면
+The Odds API ──┘             │
+                             └─> SQLite 스냅샷 ─> 채점·백테스트
+```
+
+현재 모델 버전은 `stats-v5-context-value`입니다. 상세 계산식과 데이터 누수 방침은 [모델 카드](docs/model-card.md)에 정리되어 있습니다.
+
+## HTTP 엔드포인트
+
+| 경로 | 설명 |
+| --- | --- |
+| `/` | 웹 화면 |
+| `/health` | DB, 수집기, 배당 제공사와 캐시 상태 |
+| `/api/analysis?date=YYYY-MM-DD` | 해당 날짜의 경기·타자·역배 분석 |
+| `/api/analysis?date=YYYY-MM-DD&refresh=1` | 10분 분석 캐시를 건너뛰어 다시 분석 |
+| `/api/performance` | 저장된 예측의 적중률·Brier Score·역배 ROI |
+
+화면에 필요한 정적 파일 이외의 경로는 `404`를 반환합니다.
 
 ## 로컬 개발
 
@@ -60,56 +150,33 @@ Python 3.12 이상에서 외부 패키지 없이 실행할 수 있습니다.
 python3 server.py
 ```
 
-로컬에서 Docker 이미지를 직접 빌드하려면 오버라이드를 함께 사용합니다.
+테스트 실행:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+로컬 소스로 이미지를 만들려면 Compose 오버라이드를 사용합니다.
 
 ```bash
 docker compose -f compose.yaml -f compose.local.yaml up -d --build
 ```
 
-## 포함된 기능
-
-- 반응형 데스크톱·모바일 화면
-- 날짜 이동 및 직접 선택
-- KBO 공식 일정·예고 선발·라인업·시즌 기록 수집
-- 예고 선발 ERA·WHIP, 최근 3일 불펜, 1군 엔트리, 구장·날씨를 반영한 `stats-v5-context-value` 승률
-- 실제 moneyline 배당의 무마진 시장확률과 모델 확률을 비교한 역배 EV 레이더와 경기별 `PICK / NO BET` 판정
-- 역배 EV·엣지·정배 대비 EV 우위가 모두 기준을 넘을 때만 추천
-- 경기별 예측 근거 열기·닫기
-- 전체·포수·내야 포지션·좌익수·중견수·우익수·지명타자별 안타 확률 상위 3명
-- 데이터 출처·갱신 시각·라인업 상태 표시
-- 예측 시점별 SQLite 스냅샷과 Docker 볼륨 영속화
-- 경기 종료 후 결과 자동 수집과 적중률·Brier Score 표시
-- PostgreSQL 전환용 스키마
-- 저장된 데이터를 날짜순으로 평가하고 CSV로 내보내는 백테스트 도구
-- 15분 주기의 자동 스냅샷·결과 수집기
-- 검증 성능이 개선될 때만 활성화되는 Platt 확률 보정 학습기
-- 좌투·우투·언더 유형별 시즌 타격 스플릿을 반영한 안타 확률
-
-## 계산 범위와 한계
-
-- 경기 승률은 팀 득점/경기, 팀 ERA, 출루율, 예고 선발, 불펜 부하, 1군 엔트리 이탈, 구장·날씨와 홈 이점을 결합한 설명형 통계 추정치입니다.
-- KBO는 부상 진단을 공식 구조화 데이터로 제공하지 않으므로, 부상 확정 대신 `1군 엔트리 이탈`로 표시합니다.
-- 역배 기대수익은 `모델 승률 × decimal 배당 - 1`입니다. 배당과 예측은 수익을 보장하지 않습니다.
-- 안타 확률은 시즌 타율과 상대 선발 유형별 타율을 표본 보정한 뒤 상대 선발 ERA와 타순별 예상 타수를 반영합니다.
-- 아직 과거 경기로 학습하거나 백테스트한 ML 모델이 아닙니다. 결과는 참고용이며 경기 결과를 보장하지 않습니다.
-- 공식 라인업 발표 전에는 KBO 게임센터가 제공하는 최근 라인업을 사용합니다.
-
-상세 계산식과 데이터 누수 방침은 [모델 카드](docs/model-card.md)에 정리되어 있습니다.
-
 ## 데이터와 백테스트
 
-단일 컨테이너의 기본 저장소는 `/data/playball.db` SQLite 파일입니다. 관리형 PostgreSQL로 전환할 때 사용할 DDL은 [schema/postgresql.sql](schema/postgresql.sql)에 있습니다.
-
-누적된 예측을 시간순으로 평가하고 CSV 데이터셋으로 내보냅니다.
+컨테이너의 기본 저장소는 `/data/playball.db`이며 `playball_data` 볼륨에 보존됩니다. 관리형 PostgreSQL로 전환할 때 사용할 DDL은 [schema/postgresql.sql](schema/postgresql.sql)에 있습니다.
 
 ```bash
+# 누적 예측 성능 확인
 docker compose exec playball python scripts/backtest.py --db /data/playball.db
+
+# 평가 데이터를 CSV로 내보내기
 docker compose exec playball python scripts/backtest.py \
   --db /data/playball.db \
   --export /data/evaluated_predictions.csv
 ```
 
-종료 경기 100개 이상이 쌓이면 날짜 앞 80%로 학습하고 뒤 20%로 검증하는 확률 보정기를 만들 수 있습니다. 검증 Brier Score가 개선되지 않으면 파일을 생성하지 않습니다.
+종료 경기 100개 이상이 쌓이면 날짜 앞 80%를 학습, 뒤 20%를 검증에 사용해 Platt 보정기를 만들 수 있습니다. 검증 Brier Score가 개선되지 않으면 보정 파일을 생성하지 않습니다.
 
 ```bash
 docker compose exec playball python scripts/train_calibrator.py \
@@ -117,11 +184,17 @@ docker compose exec playball python scripts/train_calibrator.py \
   --output /data/calibration.json
 ```
 
-Docker에서는 `/data/calibration.json`이 자동으로 감지됩니다.
+`/data/calibration.json`은 다음 분석부터 자동 적용됩니다. 과거 경기의 현재 시즌 최종 기록으로 과거 예측을 재구성하지 않으며, 실제 경기 전에 저장한 스냅샷만 평가에 사용합니다.
 
-과거 경기의 현재 시즌 최종 기록을 이용해 과거 예측을 재구성하면 미래 정보가 섞이므로 그렇게 하지 않습니다. 데이터셋은 실제 경기 전에 저장된 스냅샷부터 축적합니다.
+## 한계와 주의사항
 
-## 남은 구현 순서
+- 경기 승률은 팀·선발·불펜·엔트리·구장·날씨를 결합한 설명형 통계 추정치입니다.
+- KBO가 부상 진단을 구조화 데이터로 제공하지 않으므로 `부상 확정` 대신 `1군 엔트리 이탈`로 표시합니다.
+- 공식 라인업 발표 전에는 KBO 게임센터가 제공하는 최근 라인업을 사용합니다.
+- 배당 시장이 열리지 않았거나 마감된 날짜에는 역배 분석이 표시되지 않습니다.
+- 예측 확률과 기대수익은 경기 결과나 실제 수익을 보장하지 않습니다.
 
-1. 충분한 경기 전 스냅샷 축적 후 보정 학습기 활성화
+## 다음 검증 과제
+
+1. 충분한 경기 전 스냅샷을 축적해 확률 보정기를 활성화
 2. 축적 결과로 구장 득점 계수와 역배 EV 임계값 재검증
