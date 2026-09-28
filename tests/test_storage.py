@@ -21,7 +21,8 @@ class PredictionStoreTest(unittest.TestCase):
             "snapshotEligible": True,
             "games": [{
                 "id": "20260401LGOB0", "away": "LG", "home": "두산",
-                "awayProb": 40, "homeProb": 60, "pick": "두산",
+                "awayProb": 40, "homeProb": 60,
+                "awayProbability": 0.404321, "homeProbability": 0.595679, "pick": "두산",
                 "valueBet": {
                     "available": True, "recommendation": True, "returnAdvantagePp": 15.0,
                     "favorite": {"team": "두산"},
@@ -45,10 +46,35 @@ class PredictionStoreTest(unittest.TestCase):
         summary = self.store.performance_summary()
         self.assertEqual(summary["evaluatedGames"], 1)
         self.assertEqual(summary["accuracy"], 100.0)
-        self.assertEqual(summary["brierScore"], 0.16)
+        self.assertEqual(summary["brierScore"], 0.1635)
         self.assertEqual(summary["valueBet"]["settled"], 1)
         self.assertEqual(summary["valueBet"]["wins"], 0)
         self.assertEqual(summary["valueBet"]["roi"], -100.0)
+
+    def test_model_filter_is_applied_before_snapshot_ranking(self):
+        with self.store.connect() as connection:
+            for model, created_at, probability in (
+                ("wanted", "2026-04-01T10:00:00+09:00", 0.61),
+                ("other", "2026-04-01T11:00:00+09:00", 0.72),
+            ):
+                connection.execute(
+                    """INSERT INTO game_predictions
+                       (prediction_date, game_id, model_version, lineup_status, created_at,
+                        away_team, home_team, away_probability, home_probability, predicted_winner)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ("2026-04-01", "game-1", model, "projected", created_at,
+                     "LG", "두산", 1 - probability, probability, "두산"),
+                )
+            connection.execute(
+                """INSERT INTO game_results
+                   (game_id, game_date, away_team, home_team, away_score, home_score, winner, completed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("game-1", "2026-04-01", "LG", "두산", 2, 4, "두산", "2026-04-01T22:00:00+09:00"),
+            )
+        rows = self.store.evaluated_predictions("wanted")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model_version"], "wanted")
+        self.assertEqual(rows[0]["home_probability"], 0.61)
 
 
 if __name__ == "__main__":

@@ -117,13 +117,19 @@ class PredictionStore:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         analysis["date"], game["id"], model_version, lineup_status, created_at,
-                        game["away"], game["home"], game["awayProb"] / 100,
-                        game["homeProb"] / 100, game["pick"],
+                        game["away"], game["home"],
+                        game.get("awayProbability", game["awayProb"] / 100),
+                        game.get("homeProbability", game["homeProb"] / 100), game["pick"],
                     ),
                 )
                 value = game.get("valueBet") or {}
                 if value.get("available"):
                     underdog = value["underdog"]
+                    model_probability = (
+                        game.get("homeProbability", game["homeProb"] / 100)
+                        if underdog["team"] == game["home"]
+                        else game.get("awayProbability", game["awayProb"] / 100)
+                    )
                     connection.execute(
                         """INSERT OR IGNORE INTO value_bet_predictions
                            (prediction_date, game_id, model_version, lineup_status, created_at,
@@ -133,8 +139,10 @@ class PredictionStore:
                         (
                             analysis["date"], game["id"], model_version, lineup_status, created_at,
                             value["favorite"]["team"], underdog["team"], underdog["odds"],
-                            underdog["modelProbability"] / 100, underdog["marketProbability"] / 100,
-                            underdog["expectedReturnPct"] / 100, value["returnAdvantagePp"] / 100,
+                            underdog.get("modelProbabilityValue", model_probability),
+                            underdog.get("marketProbabilityValue", underdog["marketProbability"] / 100),
+                            underdog.get("expectedReturnValue", underdog["expectedReturnPct"] / 100),
+                            value.get("returnAdvantageValue", value["returnAdvantagePp"] / 100),
                             underdog["bookmaker"], int(value["recommendation"]),
                         ),
                     )
@@ -186,7 +194,7 @@ class PredictionStore:
             saved += self.save_completed_games(game_fetcher(prediction_date))
         return saved
 
-    def evaluated_predictions(self) -> list[dict[str, Any]]:
+    def evaluated_predictions(self, model_version: str | None = None) -> list[dict[str, Any]]:
         query = """
         WITH ranked AS (
           SELECT p.*,
@@ -195,6 +203,7 @@ class PredictionStore:
                    ORDER BY CASE p.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, p.created_at DESC
                  ) AS choice
           FROM game_predictions p
+          WHERE (? IS NULL OR p.model_version = ?)
         )
         SELECT p.prediction_date, p.game_id, p.model_version, p.lineup_status,
                p.away_team, p.home_team, p.away_probability, p.home_probability,
@@ -205,7 +214,7 @@ class PredictionStore:
         ORDER BY p.prediction_date, p.game_id
         """
         with self.connect() as connection:
-            rows = connection.execute(query).fetchall()
+            rows = connection.execute(query, (model_version, model_version)).fetchall()
         return [dict(row) for row in rows]
 
     def performance_summary(self) -> dict[str, Any]:

@@ -9,6 +9,9 @@ const state = { date: new Date(), position: "전체", data: null, loading: false
 const pad = (number) => String(number).padStart(2, "0");
 const toInputDate = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 const formatUpdated = (value) => new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
+const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, character => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+}[character]));
 
 function renderDate() {
   const weekdays = ["일요일", "월요일", "화요일", "수요일", "목요일", "금요일", "토요일"];
@@ -19,7 +22,7 @@ function renderDate() {
 
 function teamBlock(code, pitcher) {
   const team = teams[code] || { name: code, color: "#334139" };
-  return `<div class="team"><div class="team-badge" style="background:${team.color}">${code}</div><span class="team-name">${team.name}</span><span class="pitcher">선발 ${pitcher}</span></div>`;
+  return `<div class="team"><div class="team-badge" style="background:${team.color}">${escapeHtml(code)}</div><span class="team-name">${escapeHtml(team.name)}</span><span class="pitcher">선발 ${escapeHtml(pitcher)}</span></div>`;
 }
 
 function renderLoading() {
@@ -31,7 +34,7 @@ function renderLoading() {
 }
 
 function renderError(message) {
-  const markup = `<div class="empty-state error-state"><strong>데이터를 불러오지 못했습니다.</strong>${message}<br><button type="button" id="retryButton" class="retry-button">다시 시도</button></div>`;
+  const markup = `<div class="empty-state error-state"><strong>데이터를 불러오지 못했습니다.</strong>${escapeHtml(message)}<br><button type="button" id="retryButton" class="retry-button">다시 시도</button></div>`;
   document.querySelector("#gameGrid").innerHTML = markup;
   document.querySelector("#hitterContent").innerHTML = `<div class="empty-state"><strong>선수 예측을 표시할 수 없습니다.</strong>실제 데이터가 없을 때는 샘플 값을 대신 보여주지 않습니다.</div>`;
   document.querySelector("#valueContent").innerHTML = `<div class="empty-state"><strong>배당 가치를 표시할 수 없습니다.</strong>불완전한 데이터로 역배를 추천하지 않습니다.</div>`;
@@ -48,11 +51,11 @@ function renderGames() {
   }
   grid.innerHTML = games.map((game, index) => `
     <article class="game-card ${game.valueBet?.recommendation ? "value-pick" : ""}">
-      <div class="game-meta"><span>${game.time} · ${game.park} 야구장 · ${game.weather?.summary || "날씨 미제공"}</span><strong>${game.valueBet?.recommendation ? "역배 EV+" : `GAME ${pad(index + 1)}`}</strong></div>
-      <div class="matchup">${teamBlock(game.away, game.awayPitcher)}<div class="prediction"><small>STATS PICK</small><strong>${game.pick}</strong><span>${game.confidence}</span></div>${teamBlock(game.home, game.homePitcher)}</div>
+      <div class="game-meta"><span>${escapeHtml(game.time)} · ${escapeHtml(game.park)} 야구장 · ${escapeHtml(game.weather?.summary || "날씨 미제공")}</span><strong>${game.valueBet?.recommendation ? "역배 EV+" : `GAME ${pad(index + 1)}`}</strong></div>
+      <div class="matchup">${teamBlock(game.away, game.awayPitcher)}<div class="prediction"><small>STATS PICK</small><strong>${escapeHtml(game.pick)}</strong><span>${escapeHtml(game.confidence)}</span></div>${teamBlock(game.home, game.homePitcher)}</div>
       <div class="probability-row"><b>${game.awayProb}%</b><div class="probability-track"><i style="width:${game.awayProb}%"></i><i style="width:${game.homeProb}%"></i></div><b>${game.homeProb}%</b></div>
       <button class="reason-toggle" type="button" aria-expanded="false">실제 지표와 계산 근거 보기 <span>⌄</span></button>
-      <ul class="reasons">${game.reasons.map(reason => `<li>${reason}</li>`).join("")}<li>예고 선발: ${game.away} ${game.awayPitcher} · ${game.home} ${game.homePitcher}</li></ul>
+      <ul class="reasons">${game.reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}<li>예고 선발: ${escapeHtml(game.away)} ${escapeHtml(game.awayPitcher)} · ${escapeHtml(game.home)} ${escapeHtml(game.homePitcher)}</li></ul>
     </article>`).join("");
   grid.querySelectorAll(".reason-toggle").forEach((button) => button.addEventListener("click", () => {
     const card = button.closest(".game-card"); card.classList.toggle("open");
@@ -73,27 +76,35 @@ function renderValueBets() {
     container.innerHTML = `<div class="empty-state value-empty"><strong>배당 API가 아직 연결되지 않았습니다.</strong><code>PLAYBALL_ODDS_API_KEY</code>를 설정하면 실제 KBO 배당으로 역배 EV를 계산합니다. 배당 없이는 역배를 추천하지 않습니다.</div>`;
     return;
   }
+  if (state.data?.valueBetStatus === "provider-error") {
+    container.innerHTML = `<div class="empty-state value-empty"><strong>배당 제공사 응답을 받지 못했습니다.</strong>기존 예측은 그대로 제공하며 다음 갱신 때 배당을 다시 확인합니다. API 키와 요청 한도를 확인해 주세요.</div>`;
+    return;
+  }
   if (!available.length) {
     container.innerHTML = `<div class="empty-state value-empty"><strong>이 날짜의 사전 배당이 없습니다.</strong>배당 시장이 열리지 않았거나 이미 마감된 경기입니다.</div>`;
     return;
   }
-  if (!picks.length) {
-    container.innerHTML = `<div class="empty-state value-empty"><strong>정배를 포기할 만한 역배가 없습니다.</strong>역배 EV +8%, 시장 대비 엣지 +5%p, 정배 대비 EV 우위 +10%p를 모두 넘지 못했습니다.</div>`;
-    return;
-  }
-  container.innerHTML = picks.map(game => {
+  const sorted = [...available].sort((a, b) => b.valueBet.underdog.expectedReturnPct - a.valueBet.underdog.expectedReturnPct);
+  const lastUpdate = sorted.map(game => game.valueBet.lastUpdate).filter(Boolean).sort().at(-1);
+  container.innerHTML = `<div class="value-summary"><strong>${picks.length ? `${picks.length}경기 역배 추천` : "추천 없음"}</strong><span>${available.length}경기 배당 비교${lastUpdate ? ` · ${formatUpdated(lastUpdate)} 기준` : ""}</span></div>` + sorted.map(game => {
     const value = game.valueBet;
     const dog = value.underdog;
     const favorite = value.favorite;
-    return `<article class="value-card">
-      <div class="value-card-head"><span>${game.away} @ ${game.home}</span><strong>역배 PICK · ${dog.team}</strong></div>
+    const criterion = value.criterion;
+    const misses = [];
+    if (dog.expectedReturnPct < criterion.minimumEvPct) misses.push(`EV ${signed(criterion.minimumEvPct)} 미달`);
+    if (dog.edgePp < criterion.minimumEdgePp) misses.push(`엣지 ${signed(criterion.minimumEdgePp, "%p")} 미달`);
+    if (value.returnAdvantagePp < criterion.minimumAdvantagePp) misses.push(`정배 대비 ${signed(criterion.minimumAdvantagePp, "%p")} 미달`);
+    const verdict = value.recommendation ? "세 기준을 모두 충족해 정배 대신 선택할 가치가 있습니다." : `보류: ${misses.join(" · ")}`;
+    return `<article class="value-card ${value.recommendation ? "recommended" : "no-bet"}">
+      <div class="value-card-head"><span>${escapeHtml(game.away)} @ ${escapeHtml(game.home)}</span><strong>${value.recommendation ? "역배 PICK" : "NO BET"} · ${escapeHtml(dog.team)}</strong></div>
       <div class="value-metrics">
-        <div><small>최고 배당</small><b>${dog.odds.toFixed(2)}</b><span>${dog.bookmaker}</span></div>
+        <div><small>최고 배당</small><b>${dog.odds.toFixed(2)}</b><span>${escapeHtml(dog.bookmaker)}</span></div>
         <div><small>모델 / 시장</small><b>${dog.modelProbability}%</b><span>${dog.marketProbability}% · 엣지 ${signed(dog.edgePp, "%p")}</span></div>
         <div class="primary"><small>역배 기대수익</small><b>${signed(dog.expectedReturnPct)}</b><span>1만원당 기대 ${signed(Math.round(dog.expectedReturnPct * 100), "원")}</span></div>
-        <div><small>정배 기대수익</small><b>${signed(favorite.expectedReturnPct)}</b><span>${favorite.team} @ ${favorite.odds.toFixed(2)}</span></div>
+        <div><small>정배 기대수익</small><b>${signed(favorite.expectedReturnPct)}</b><span>${escapeHtml(favorite.team)} @ ${favorite.odds.toFixed(2)}</span></div>
       </div>
-      <p>정배 대비 기대수익 우위 <strong>${signed(value.returnAdvantagePp, "%p")}</strong> · ${value.bookmakerCount}개 북메이커 비교</p>
+      <p>정배 대비 기대수익 우위 <strong>${signed(value.returnAdvantagePp, "%p")}</strong> · ${value.bookmakerCount}개 북메이커 비교<br><span class="value-verdict">${escapeHtml(verdict)}</span></p>
     </article>`;
   }).join("");
 }
@@ -102,7 +113,7 @@ function renderFilters() {
   const filter = document.querySelector("#positionFilters");
   const positions = Object.keys(state.data?.hitters || {});
   if (!positions.includes(state.position)) state.position = positions[0] || "전체";
-  filter.innerHTML = positions.map(position => `<button type="button" role="tab" aria-selected="${state.position === position}" class="position-button ${state.position === position ? "active" : ""}" data-position="${position}">${position}</button>`).join("");
+  filter.innerHTML = positions.map(position => `<button type="button" role="tab" aria-selected="${state.position === position}" class="position-button ${state.position === position ? "active" : ""}" data-position="${escapeHtml(position)}">${escapeHtml(position)}</button>`).join("");
   filter.querySelectorAll("button").forEach(button => button.addEventListener("click", () => {
     state.position = button.dataset.position; renderFilters(); renderHitters();
   }));
@@ -119,17 +130,17 @@ function renderHitters() {
   const lineupLabel = first.lineupConfirmed ? "확정 라인업" : "최근 라인업";
   content.innerHTML = `
     <article class="hitter-feature" data-number="1">
-      <div><div class="rank-label">NO. 1 · ${first.rawPosition}</div><h3 class="hitter-name">${first.name}</h3><div class="hitter-team">${teams[first.team]?.name || first.team}</div><div class="matchup-note"><span>${first.opponent}</span><span>${first.pitcher}</span><span>${first.order}</span><span>시즌 AVG ${first.avg.toFixed(3)}</span><span>vs ${first.pitcherHand} AVG ${first.matchupAvg.toFixed(3)} (${first.matchupAb}타수)</span><span>${lineupLabel}</span></div></div>
+      <div><div class="rank-label">NO. 1 · ${escapeHtml(first.rawPosition)}</div><h3 class="hitter-name">${escapeHtml(first.name)}</h3><div class="hitter-team">${escapeHtml(teams[first.team]?.name || first.team)}</div><div class="matchup-note"><span>${escapeHtml(first.opponent)}</span><span>${escapeHtml(first.pitcher)}</span><span>${escapeHtml(first.order)}</span><span>시즌 AVG ${first.avg.toFixed(3)}</span><span>vs ${escapeHtml(first.pitcherHand)} AVG ${first.matchupAvg.toFixed(3)} (${first.matchupAb}타수)</span><span>${lineupLabel}</span></div></div>
       <div class="probability-ring" style="background: conic-gradient(var(--green) ${first.probability * 3.6}deg, #263a31 0deg)"><div><strong>${first.probability}%</strong><span>1+ HIT</span></div></div>
     </article>
-    <div class="hitter-runners">${rest.map((player, index) => `<article class="runner-card"><strong>0${index + 2}</strong><div><h3>${player.name} <small>· ${player.rawPosition}</small></h3><p>${teams[player.team]?.name || player.team} · ${player.opponent} · 시즌 ${player.avg.toFixed(3)} · ${player.pitcherHand} 상대 ${player.matchupAvg.toFixed(3)} · ${player.order}</p></div><span class="runner-prob">${player.probability}%</span></article>`).join("")}</div>`;
+    <div class="hitter-runners">${rest.map((player, index) => `<article class="runner-card"><strong>0${index + 2}</strong><div><h3>${escapeHtml(player.name)} <small>· ${escapeHtml(player.rawPosition)}</small></h3><p>${escapeHtml(teams[player.team]?.name || player.team)} · ${escapeHtml(player.opponent)} · 시즌 ${player.avg.toFixed(3)} · ${escapeHtml(player.pitcherHand)} 상대 ${player.matchupAvg.toFixed(3)} · ${escapeHtml(player.order)}</p></div><span class="runner-prob">${player.probability}%</span></article>`).join("")}</div>`;
 }
 
 function renderAnalysis() {
   renderGames(); renderValueBets(); renderFilters(); renderHitters();
   const status = state.data.lineupStatus === "confirmed" ? "확정 라인업 반영" : "최근 라인업 기준";
   document.querySelector("#lineupLegend").innerHTML = `<i></i> ${status}`;
-  document.querySelector("#dataNotice").innerHTML = `<span>LIVE DATA</span> 출처: ${(state.data.sources || [state.data.source]).join(" · ")} · ${formatUpdated(state.data.updatedAt)} 갱신 · ${state.data.methodVersion}`;
+  document.querySelector("#dataNotice").innerHTML = `<span>LIVE DATA</span> 출처: ${(state.data.sources || [state.data.source]).map(escapeHtml).join(" · ")} · ${formatUpdated(state.data.updatedAt)} 갱신 · ${escapeHtml(state.data.methodVersion)}`;
   document.querySelector("#liveStatus").innerHTML = `<i></i> ${formatUpdated(state.data.updatedAt)} 갱신`;
 }
 
@@ -143,9 +154,9 @@ async function loadPerformance() {
     const value = data.valueBet || { recommended: 0, settled: 0, wins: 0, roi: null, profitUnits: 0 };
     const recent = data.recent.length ? `<div class="performance-history"><h3>최근 채점 결과</h3>${data.recent.map(game => `
       <article class="result-row">
-        <time>${game.date}</time><div><strong>${game.away} ${game.score} ${game.home}</strong><span>예측 ${game.pick} · 승리 ${game.winner}</span></div>
+        <time>${escapeHtml(game.date)}</time><div><strong>${escapeHtml(game.away)} ${escapeHtml(game.score)} ${escapeHtml(game.home)}</strong><span>예측 ${escapeHtml(game.pick)} · 승리 ${escapeHtml(game.winner)}</span></div>
         <b class="result-badge ${game.correct === true ? "correct" : game.correct === false ? "wrong" : "tie"}">${game.correct === true ? "적중" : game.correct === false ? "실패" : "무승부"}</b>
-      </article>`).join("")}</div>` : `<div class="performance-empty"><strong>첫 채점을 기다리는 중입니다.</strong><p>${data.message}</p></div>`;
+      </article>`).join("")}</div>` : `<div class="performance-empty"><strong>첫 채점을 기다리는 중입니다.</strong><p>${escapeHtml(data.message)}</p></div>`;
     container.innerHTML = `<div class="metric-grid">
       <article><span>평가 경기</span><strong>${data.evaluatedGames}</strong><small>GAMES</small></article>
       <article><span>승패 적중률</span><strong>${metric(data.accuracy, "%")}</strong><small>${data.correctGames} / ${data.decidedGames}</small></article>
@@ -154,7 +165,7 @@ async function loadPerformance() {
       <article><span>역배 실현 ROI</span><strong>${metric(value.roi, "%")}</strong><small>${signed(value.profitUnits, " units")}</small></article>
     </div>${recent}`;
   } catch (error) {
-    container.innerHTML = `<div class="empty-state error-state"><strong>성능 정보를 표시할 수 없습니다.</strong>${error.message}</div>`;
+    container.innerHTML = `<div class="empty-state error-state"><strong>성능 정보를 표시할 수 없습니다.</strong>${escapeHtml(error.message)}</div>`;
   }
 }
 

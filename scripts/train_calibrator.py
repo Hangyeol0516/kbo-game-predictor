@@ -46,8 +46,8 @@ def main() -> None:
     parser.add_argument("--minimum-games", type=int, default=100)
     args = parser.parse_args()
     rows = [
-        row for row in PredictionStore(args.db).evaluated_predictions()
-        if row["winner"] is not None and row["model_version"] == BASE_MODEL_VERSION
+        row for row in PredictionStore(args.db).evaluated_predictions(BASE_MODEL_VERSION)
+        if row["winner"] is not None
     ]
     if len(rows) < args.minimum_games:
         raise SystemExit(f"학습 중단: 최소 {args.minimum_games}경기가 필요하지만 현재 {len(rows)}경기입니다.")

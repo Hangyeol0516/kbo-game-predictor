@@ -143,10 +143,16 @@ main { overflow: hidden; }
 .value-section .section-kicker { color: var(--orange); }
 .value-section .section-description, .value-section .ranking-unit { color: #89948e; }
 .value-content { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.value-summary { grid-column: 1 / -1; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 0 2px; }
+.value-summary strong { color: white; font-size: 14px; }
+.value-summary span { color: #89948e; font: 500 10px "IBM Plex Mono", monospace; }
 .value-empty { color: #89948e; border-color: #385046; }
 .value-empty strong { color: white; }
 .value-empty code { margin: 0 5px; color: var(--green); font: 600 11px "IBM Plex Mono", monospace; }
 .value-card { border: 1px solid #3b4e46; border-radius: 11px; background: #17251f; overflow: hidden; }
+.value-card.recommended { border-color: rgba(49,220,120,.55); box-shadow: 0 4px 0 rgba(49,220,120,.08); }
+.value-card.no-bet { opacity: .72; }
+.value-card.no-bet .value-card-head strong { color: #9aaaa2; }
 .value-card-head { padding: 14px 18px; display: flex; justify-content: space-between; gap: 15px; background: #213129; color: #9aaaa2; font-size: 11px; }
 .value-card-head strong { color: #ff8a65; }
 .value-metrics { padding: 18px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
@@ -157,6 +163,8 @@ main { overflow: hidden; }
 .value-metrics .primary b { color: var(--green); }
 .value-card > p { margin: 0; padding: 0 18px 18px; color: #8d9b94; font-size: 10px; }
 .value-card > p strong { color: white; }
+.value-verdict { display: inline-block; margin-top: 7px; color: #aab5af; }
+.value-card.recommended .value-verdict { color: var(--green); }
 
 .hitters-section { max-width: none; padding-left: max(24px, calc((100vw - 1200px) / 2)); padding-right: max(24px, calc((100vw - 1200px) / 2)); background: #e7e4da; }
 .hitters-heading { max-width: 1200px; margin-left: auto; margin-right: auto; }

@@ -4,7 +4,7 @@ KBO 당일 경기 승률, 포지션별 1안타 이상 확률, 실제 배당 기�
 
 ## 권장 배포: 완성 이미지 받기
 
-GitHub Container Registry에서 완성된 이미지를 받아 앱 컨테이너 하나와 영속 데이터 볼륨을 실행합니다. 배포 서버에서 빌드할 필요가 없으며 PostgreSQL 컨테이너도 필요하지 않습니다.
+GitHub Container Registry에서 완성된 이미지를 받아 앱 컨테이너 하나와 영속 데이터 볼륨을 실행합니다. 배포 서버에서 빌드할 필요가 없으며 PostgreSQL 컨테이너도 필요하지 않습니다. 이미지는 Python Alpine 기반이며 실행에 필요한 파일만 담습니다.
 
 ```bash
 git clone https://github.com/Hangyeol0516/kbo-game-predictor.git
@@ -20,7 +20,9 @@ cp .env.example .env
 docker compose up -d
 ```
 
-기본 역배 추천 기준은 EV 8%, 시장 대비 엣지 5%p, 정배 대비 EV 우위 10%p입니다. `.env.example`의 세 임계값으로 조정할 수 있습니다.
+기본 역배 추천 기준은 EV 8%, 시장 대비 엣지 5%p, 정배 대비 EV 우위 10%p입니다. 추천하지 않는 경기에도 실제 수치와 미달 기준을 함께 표시하므로, 왜 정배를 포기하지 않았는지 확인할 수 있습니다. `.env.example`의 세 임계값으로 조정할 수 있습니다.
+
+무료 배당 쿼터를 아끼기 위해 기본 지역은 `eu` 한 곳이며 응답 전체를 1시간 캐시합니다. `PLAYBALL_ODDS_REGIONS`에 지역을 추가하면 요청 비용도 늘어날 수 있습니다. 캐시 시간은 `PLAYBALL_ODDS_CACHE_SECONDS`로 조정합니다.
 
 브라우저에서 <http://localhost:8000>을 엽니다. 포트를 바꾸려면 `PLAYBALL_PORT=8080 docker compose up -d`처럼 실행합니다.
 
@@ -48,7 +50,7 @@ docker run -d \
   ghcr.io/hangyeol0516/kbo-game-predictor:latest
 ```
 
-컨테이너는 비루트 사용자로 실행되며 `/health`로 상태를 확인합니다. 예측 스냅샷은 `playball_data` 볼륨에 보존됩니다.
+컨테이너는 비루트 사용자로 실행되며 `/health`에서 수집기 상태, 배당 연결 상태와 남은 API 요청량을 확인합니다. 예측 스냅샷은 `playball_data` 볼륨에 보존됩니다. 웹 서버는 화면에 필요한 정적 파일만 공개하며 `.env`, 데이터베이스와 소스 파일은 제공하지 않습니다.
 
 ## 로컬 개발
 
@@ -70,7 +72,7 @@ docker compose -f compose.yaml -f compose.local.yaml up -d --build
 - 날짜 이동 및 직접 선택
 - KBO 공식 일정·예고 선발·라인업·시즌 기록 수집
 - 예고 선발 ERA·WHIP, 최근 3일 불펜, 1군 엔트리, 구장·날씨를 반영한 `stats-v5-context-value` 승률
-- 실제 moneyline 배당의 무마진 시장확률과 모델 확률을 비교한 역배 EV 레이더
+- 실제 moneyline 배당의 무마진 시장확률과 모델 확률을 비교한 역배 EV 레이더와 경기별 `PICK / NO BET` 판정
 - 역배 EV·엣지·정배 대비 EV 우위가 모두 기준을 넘을 때만 추천
 - 경기별 예측 근거 열기·닫기
 - 전체·포수·내야 포지션·좌익수·중견수·우익수·지명타자별 안타 확률 상위 3명

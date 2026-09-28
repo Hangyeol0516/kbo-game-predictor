@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import math
@@ -22,6 +23,7 @@ from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from typing import Any
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 
@@ -66,6 +68,14 @@ PARKS = {
     "창원": {"lat": 35.2225, "lon": 128.5822, "runFactor": 0.98, "indoor": False},
     "포항": {"lat": 36.0082, "lon": 129.3594, "runFactor": 1.00, "indoor": False},
     "울산": {"lat": 35.5322, "lon": 129.2656, "runFactor": 1.00, "indoor": False},
+}
+
+_odds_lock = threading.Lock()
+_odds_fetch_lock = threading.Lock()
+_odds_cache: dict[str, Any] = {"created": 0.0, "regions": None, "credential": None, "eventsByDate": {}}
+_odds_state: dict[str, Any] = {
+    "lastFetch": None, "lastError": None, "creditsRemaining": None,
+    "creditsUsed": None, "requestCost": None, "eventCount": 0,
 }
 
 POSITION_GROUPS = {
@@ -157,10 +167,14 @@ def _get_text(url: str, opener=None) -> str:
     return response.read().decode("utf-8")
 
 
-def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
+def _get_json_response(url: str, headers: dict[str, str] | None = None) -> tuple[Any, dict[str, str]]:
     request_headers = {"User-Agent": USER_AGENT, **(headers or {})}
     with urlopen(Request(url, headers=request_headers), timeout=15) as response:
-        return json.loads(response.read())
+        return json.loads(response.read()), {key.lower(): value for key, value in response.headers.items()}
+
+
+def _get_json(url: str, headers: dict[str, str] | None = None) -> Any:
+    return _get_json_response(url, headers)[0]
 
 
 def _post_json(path: str, payload: dict[str, str]) -> Any:
@@ -315,17 +329,28 @@ def _odds_team_name(value: str) -> str | None:
     return next((team for alias, team in ODDS_TEAM_NAMES.items() if alias in normalized), None)
 
 
-def fetch_market_odds(date: str) -> dict[tuple[str, str], dict[str, Any]]:
-    """북메이커별 moneyline을 정규화하고 최고 배당과 무마진 합의확률을 만든다."""
-    api_key = os.environ.get("PLAYBALL_ODDS_API_KEY", "").strip()
-    if not api_key:
-        return {}
-    query = urlencode({
-        "apiKey": api_key, "regions": os.environ.get("PLAYBALL_ODDS_REGIONS", "eu,au"),
-        "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso",
-    })
-    raw = _get_json(f"{ODDS_API_URL}?{query}")
-    results: dict[tuple[str, str], dict[str, Any]] = {}
+def _odds_cache_ttl() -> int:
+    try:
+        return max(int(os.environ.get("PLAYBALL_ODDS_CACHE_SECONDS", "3600")), 300)
+    except ValueError:
+        return 3600
+
+
+def odds_provider_status() -> dict[str, Any]:
+    ttl = _odds_cache_ttl()
+    with _odds_lock:
+        age = time.time() - float(_odds_cache["created"])
+        return {
+            "configured": bool(os.environ.get("PLAYBALL_ODDS_API_KEY", "").strip()),
+            "regions": os.environ.get("PLAYBALL_ODDS_REGIONS", "eu"),
+            "cacheTtlSeconds": ttl,
+            "cacheAgeSeconds": round(age) if _odds_cache["created"] else None,
+            **_odds_state,
+        }
+
+
+def _parse_market_odds(raw: list[dict[str, Any]]) -> dict[str, dict[tuple[str, str], dict[str, Any]]]:
+    results_by_date: dict[str, dict[tuple[str, str], dict[str, Any]]] = defaultdict(dict)
     for event in raw:
         away, home = _odds_team_name(event.get("away_team", "")), _odds_team_name(event.get("home_team", ""))
         if not away or not home:
@@ -334,8 +359,6 @@ def fetch_market_odds(date: str) -> dict[tuple[str, str], dict[str, Any]]:
         try:
             event_date = datetime.fromisoformat(commence.replace("Z", "+00:00")).astimezone(KST).date().isoformat()
         except ValueError:
-            continue
-        if event_date != date:
             continue
         best: dict[str, dict[str, Any]] = {}
         fair_samples: dict[str, list[float]] = {away: [], home: []}
@@ -359,7 +382,7 @@ def fetch_market_odds(date: str) -> dict[tuple[str, str], dict[str, Any]]:
                 fair_samples[home].append(raw_home / total)
                 last_update = max(last_update or "", bookmaker.get("last_update") or "")
         if away in best and home in best and fair_samples[away] and fair_samples[home]:
-            results[(away, home)] = {
+            results_by_date[event_date][(away, home)] = {
                 "teams": {
                     away: {**best[away], "marketProbability": statistics.median(fair_samples[away])},
                     home: {**best[home], "marketProbability": statistics.median(fair_samples[home])},
@@ -367,7 +390,62 @@ def fetch_market_odds(date: str) -> dict[tuple[str, str], dict[str, Any]]:
                 "bookmakerCount": min(len(fair_samples[away]), len(fair_samples[home])),
                 "lastUpdate": last_update,
             }
-    return results
+    return dict(results_by_date)
+
+
+def fetch_market_odds(date: str) -> dict[tuple[str, str], dict[str, Any]]:
+    """북메이커별 moneyline을 정규화하고 1시간 캐시로 API 쿼터를 보호한다."""
+    api_key = os.environ.get("PLAYBALL_ODDS_API_KEY", "").strip()
+    if not api_key:
+        return {}
+    regions = os.environ.get("PLAYBALL_ODDS_REGIONS", "eu")
+    credential = hashlib.sha256(api_key.encode()).hexdigest()[:12]
+    ttl = _odds_cache_ttl()
+    with _odds_lock:
+        cache_valid = (
+            _odds_cache["regions"] == regions
+            and _odds_cache["credential"] == credential
+            and time.time() - _odds_cache["created"] < ttl
+        )
+        if cache_valid:
+            return _odds_cache["eventsByDate"].get(date, {})
+
+    # 네트워크 호출만 직렬화하고 상태 조회와 헬스체크는 막지 않는다.
+    with _odds_fetch_lock:
+        with _odds_lock:
+            cache_valid = (
+                _odds_cache["regions"] == regions
+                and _odds_cache["credential"] == credential
+                and time.time() - _odds_cache["created"] < ttl
+            )
+            if cache_valid:
+                return _odds_cache["eventsByDate"].get(date, {})
+        query = urlencode({
+            "apiKey": api_key, "regions": regions, "markets": "h2h",
+            "oddsFormat": "decimal", "dateFormat": "iso",
+        })
+        try:
+            raw, headers = _get_json_response(f"{ODDS_API_URL}?{query}")
+            events_by_date = _parse_market_odds(raw)
+            now = datetime.now(KST).isoformat(timespec="seconds")
+            with _odds_lock:
+                _odds_cache.update({
+                    "created": time.time(), "regions": regions,
+                    "credential": credential, "eventsByDate": events_by_date,
+                })
+                _odds_state.update({
+                    "lastFetch": now, "lastError": None,
+                    "creditsRemaining": _number(headers.get("x-requests-remaining", ""), None),
+                    "creditsUsed": _number(headers.get("x-requests-used", ""), None),
+                    "requestCost": _number(headers.get("x-requests-last", ""), None),
+                    "eventCount": len(raw),
+                })
+        except Exception as exc:
+            error_name = f"HTTP {exc.code}" if isinstance(exc, HTTPError) else type(exc).__name__
+            with _odds_lock:
+                _odds_state.update({"lastError": error_name, "lastFetch": datetime.now(KST).isoformat(timespec="seconds")})
+                return {}
+        return events_by_date.get(date, {})
 
 
 def fetch_lineup(game: dict[str, Any]) -> dict[str, Any]:
@@ -650,6 +728,9 @@ def evaluate_value_bet(
         market_probability = teams[team]["marketProbability"]
         expected_return = model[team] * price - 1
         return {
+            "modelProbabilityValue": round(model[team], 6),
+            "marketProbabilityValue": round(market_probability, 6),
+            "expectedReturnValue": round(expected_return, 6),
             "team": team, "modelProbability": round(model[team] * 100, 1),
             "marketProbability": round(market_probability * 100, 1),
             "edgePp": round((model[team] - market_probability) * 100, 1),
@@ -658,22 +739,26 @@ def evaluate_value_bet(
         }
 
     favorite_metrics, underdog_metrics = metrics(favorite), metrics(underdog)
-    advantage = underdog_metrics["expectedReturnPct"] - favorite_metrics["expectedReturnPct"]
-    min_ev = float(os.environ.get("PLAYBALL_UPSET_MIN_EV", "0.08")) * 100
-    min_edge = float(os.environ.get("PLAYBALL_UPSET_MIN_EDGE", "0.05")) * 100
-    min_advantage = float(os.environ.get("PLAYBALL_UPSET_MIN_ADVANTAGE", "0.10")) * 100
+    advantage = underdog_metrics["expectedReturnValue"] - favorite_metrics["expectedReturnValue"]
+    min_ev = float(os.environ.get("PLAYBALL_UPSET_MIN_EV", "0.08"))
+    min_edge = float(os.environ.get("PLAYBALL_UPSET_MIN_EDGE", "0.05"))
+    min_advantage = float(os.environ.get("PLAYBALL_UPSET_MIN_ADVANTAGE", "0.10"))
     recommendation = (
-        underdog_metrics["expectedReturnPct"] >= min_ev
-        and underdog_metrics["edgePp"] >= min_edge
+        underdog_metrics["expectedReturnValue"] >= min_ev
+        and underdog_metrics["modelProbabilityValue"] - underdog_metrics["marketProbabilityValue"] >= min_edge
         and advantage >= min_advantage
     )
     return {
         "available": True, "recommendation": recommendation,
         "favorite": favorite_metrics, "underdog": underdog_metrics,
-        "returnAdvantagePp": round(advantage, 1),
+        "returnAdvantageValue": round(advantage, 6),
+        "returnAdvantagePp": round(advantage * 100, 1),
         "bookmakerCount": market.get("bookmakerCount", 0),
         "lastUpdate": market.get("lastUpdate"),
-        "criterion": {"minimumEvPct": min_ev, "minimumEdgePp": min_edge, "minimumAdvantagePp": min_advantage},
+        "criterion": {
+            "minimumEvPct": min_ev * 100, "minimumEdgePp": min_edge * 100,
+            "minimumAdvantagePp": min_advantage * 100,
+        },
     }
 
 
@@ -737,8 +822,8 @@ def _game_prediction(
     better_pitching = home_name if home["era"] < away["era"] else away_name
 
     value_bet = evaluate_value_bet(
-        away_name, home_name, away_probability=away_percent / 100,
-        home_probability=home_percent / 100, market=market_odds,
+        away_name, home_name, away_probability=1 - home_probability,
+        home_probability=home_probability, market=market_odds,
     )
     away_absent = ", ".join(item["name"] for item in away_availability["coreAbsent"]) or "없음"
     home_absent = ", ".join(item["name"] for item in home_availability["coreAbsent"]) or "없음"
@@ -746,7 +831,10 @@ def _game_prediction(
         "id": game["G_ID"], "time": game["G_TM"], "park": game["S_NM"],
         "away": away_name, "home": home_name,
         "awayPitcher": away_pitcher_name or "미정", "homePitcher": home_pitcher_name or "미정",
-        "awayProb": away_percent, "homeProb": home_percent, "pick": pick, "confidence": confidence,
+        "awayProb": away_percent, "homeProb": home_percent,
+        "awayProbability": round(1 - home_probability, 6),
+        "homeProbability": round(home_probability, 6),
+        "pick": pick, "confidence": confidence,
         "lineupConfirmed": bool(game.get("LINEUP_CK")),
         "weather": weather, "availability": {"away": away_availability, "home": home_availability},
         "valueBet": value_bet,
@@ -855,11 +943,13 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
     games = fetch_games(date)
     calibrator = load_calibrator()
     method_version = f"{BASE_MODEL_VERSION}+platt-v1" if calibrator else BASE_MODEL_VERSION
+    odds_state = odds_provider_status()
     if not games:
+        value_status = "not-configured" if not odds_state["configured"] else "no-market"
         result = {
             "date": date, "games": [], "hitters": {}, "updatedAt": datetime.now(KST).isoformat(timespec="seconds"),
             "source": "KBO 공식 홈페이지", "sources": ["KBO 공식 홈페이지", "Open-Meteo"],
-            "methodVersion": method_version, "valueBetStatus": "not-configured" if not os.environ.get("PLAYBALL_ODDS_API_KEY") else "no-market",
+            "methodVersion": method_version, "valueBetStatus": value_status, "odds": odds_state,
             "valueBets": [], "snapshotEligible": False,
         }
     else:
@@ -903,6 +993,7 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
                 market_odds = odds_future.result()
             except Exception:
                 market_odds = {}
+        odds_state = odds_provider_status()
         lineups = {game["G_ID"]: lineup for game, lineup in zip(games, lineup_results)}
         game_predictions = [
             _game_prediction(
@@ -915,13 +1006,21 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
             games, lineups, hitter_stats, team_stats, pitcher_stats, pitcher_hands, matchup_hitter_stats, roster_status,
         )
         value_available = any(game["valueBet"]["available"] for game in game_predictions)
+        if value_available:
+            value_status = "connected"
+        elif not odds_state["configured"]:
+            value_status = "not-configured"
+        elif odds_state["lastError"]:
+            value_status = "provider-error"
+        else:
+            value_status = "no-market"
         result = {
             "date": date, "games": game_predictions, "hitters": hitter_predictions,
             "lineupStatus": "confirmed" if all_confirmed else "projected",
             "updatedAt": datetime.now(KST).isoformat(timespec="seconds"),
-            "source": "KBO 공식 홈페이지", "sources": ["KBO 공식 홈페이지", "Open-Meteo"] + (["The Odds API"] if value_available else []),
+            "source": "KBO 공식 홈페이지", "sources": ["KBO 공식 홈페이지", "Open-Meteo"] + (["The Odds API"] if odds_state["configured"] else []),
             "methodVersion": method_version,
-            "valueBetStatus": "connected" if value_available else ("no-market" if os.environ.get("PLAYBALL_ODDS_API_KEY") else "not-configured"),
+            "valueBetStatus": value_status, "odds": odds_state,
             "valueBets": [game["valueBet"] | {"gameId": game["id"], "away": game["away"], "home": game["home"]} for game in game_predictions if game["valueBet"].get("recommendation")],
             "snapshotEligible": all(str(game.get("GAME_STATE_SC")) == "1" and not bool(game.get("GAME_RESULT_CK")) for game in games),
             "disclaimer": "공식 기록을 사용한 설명형 통계 추정치이며, 배당 기대수익은 수익을 보장하지 않습니다.",
