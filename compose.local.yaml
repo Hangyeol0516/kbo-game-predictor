@@ -1,0 +1,5 @@
+services:
+  playball:
+    build: .
+    image: kbo-game-predictor:local
+    pull_policy: build

@@ -1,7 +1,7 @@
 services:
   playball:
-    build: .
-    image: kbo-game-predictor:latest
+    image: "ghcr.io/hangyeol0516/kbo-game-predictor:${PLAYBALL_IMAGE_TAG:-latest}"
+    pull_policy: always
     container_name: kbo-game-predictor
     restart: unless-stopped
     ports:

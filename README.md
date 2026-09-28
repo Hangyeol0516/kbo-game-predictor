@@ -2,14 +2,14 @@
 
 KBO 당일 경기 승률, 포지션별 1안타 이상 확률, 실제 배당 기준 역배 기대수익을 보여주는 프로토타입입니다. 일정, 예고 선발, 라인업, 1군 엔트리와 시즌 기록은 KBO 공식 홈페이지에서 가져옵니다.
 
-## 권장 배포: 단일 컨테이너
+## 권장 배포: 완성 이미지 받기
 
-Docker Compose로 앱 컨테이너 하나와 영속 데이터 볼륨을 실행합니다. PostgreSQL 컨테이너는 필요하지 않습니다.
+GitHub Container Registry에서 완성된 이미지를 받아 앱 컨테이너 하나와 영속 데이터 볼륨을 실행합니다. 배포 서버에서 빌드할 필요가 없으며 PostgreSQL 컨테이너도 필요하지 않습니다.
 
 ```bash
 git clone https://github.com/Hangyeol0516/kbo-game-predictor.git
 cd kbo-game-predictor
-docker compose up -d --build
+docker compose up -d
 ```
 
 역배 EV는 The Odds API의 KBO moneyline 배당을 사용합니다. API 키가 없으면 예측은 정상 작동하지만 역배를 추천하지 않습니다.
@@ -17,7 +17,7 @@ docker compose up -d --build
 ```bash
 cp .env.example .env
 # .env에 PLAYBALL_ODDS_API_KEY 입력
-docker compose up -d --build
+docker compose up -d
 ```
 
 기본 역배 추천 기준은 EV 8%, 시장 대비 엣지 5%p, 정배 대비 EV 우위 10%p입니다. `.env.example`의 세 임계값으로 조정할 수 있습니다.
@@ -28,20 +28,24 @@ docker compose up -d --build
 
 ```bash
 git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 docker compose logs -f
 ```
+
+`latest` 대신 특정 이미지 태그를 고정하려면 `PLAYBALL_IMAGE_TAG`를 지정합니다. `sha-<Git 커밋 앞 7자리>` 태그가 커밋마다 자동 생성됩니다.
 
 Compose 없이 Docker만 사용할 수도 있습니다.
 
 ```bash
-docker build -t kbo-game-predictor:latest .
+docker pull ghcr.io/hangyeol0516/kbo-game-predictor:latest
 docker run -d \
   --name kbo-game-predictor \
   --restart unless-stopped \
   -p 8000:8000 \
   -v playball_data:/data \
-  kbo-game-predictor:latest
+  --env-file .env \
+  ghcr.io/hangyeol0516/kbo-game-predictor:latest
 ```
 
 컨테이너는 비루트 사용자로 실행되며 `/health`로 상태를 확인합니다. 예측 스냅샷은 `playball_data` 볼륨에 보존됩니다.
@@ -52,6 +56,12 @@ Python 3.12 이상에서 외부 패키지 없이 실행할 수 있습니다.
 
 ```bash
 python3 server.py
+```
+
+로컬에서 Docker 이미지를 직접 빌드하려면 오버라이드를 함께 사용합니다.
+
+```bash
+docker compose -f compose.yaml -f compose.local.yaml up -d --build
 ```
 
 ## 포함된 기능

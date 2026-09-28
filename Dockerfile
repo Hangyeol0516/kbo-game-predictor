@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.source="https://github.com/Hangyeol0516/kbo-game-predictor" \
+      org.opencontainers.image.description="PLAYBALL KBO game prediction and underdog value analysis"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     KBO_HOST=0.0.0.0 \
