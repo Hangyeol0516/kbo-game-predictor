@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -82,6 +83,36 @@ class PredictionStoreTest(unittest.TestCase):
                 "SELECT game_id, lineup_status FROM game_predictions ORDER BY game_id",
             ).fetchall()
         self.assertEqual([tuple(row) for row in rows], [("eligible", "confirmed")])
+
+    def test_later_pregame_snapshot_replaces_earlier_market_price(self):
+        analysis = {
+            "date": "2026-04-01", "updatedAt": "2026-04-01T09:00:00+09:00",
+            "methodVersion": "model-a", "lineupStatus": "projected", "snapshotEligible": True,
+            "games": [{
+                "id": "game-1", "away": "LG", "home": "두산", "awayProb": 45, "homeProb": 55,
+                "pick": "두산", "snapshotEligible": True,
+                "valueBet": {
+                    "available": True, "recommendation": False, "returnAdvantagePp": 5,
+                    "favorite": {"team": "두산"},
+                    "underdog": {"team": "LG", "odds": 2.2, "modelProbability": 45,
+                                 "marketProbability": 43, "expectedReturnPct": -1, "bookmaker": "A"},
+                },
+            }],
+        }
+        later = deepcopy(analysis)
+        later["updatedAt"] = "2026-04-01T18:00:00+09:00"
+        later["games"][0]["valueBet"]["underdog"]["odds"] = 2.6
+        later["games"][0]["valueBet"]["underdog"]["expectedReturnPct"] = 17
+        later["games"][0]["valueBet"]["recommendation"] = True
+        with patch("storage.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value.date.return_value.isoformat.return_value = "2026-04-01"
+            self.store.save_analysis(analysis)
+            self.store.save_analysis(later)
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT created_at, underdog_odds, recommended FROM value_bet_predictions",
+            ).fetchone()
+        self.assertEqual(tuple(row), ("2026-04-01T18:00:00+09:00", 2.6, 1))
 
     def test_model_filter_is_applied_before_snapshot_ranking(self):
         with self.store.connect() as connection:

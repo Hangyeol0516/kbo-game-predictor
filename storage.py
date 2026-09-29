@@ -136,9 +136,11 @@ class PredictionStore:
         ) else "projected"
         with self.connect() as connection:
             connection.execute(
-                """INSERT OR IGNORE INTO analysis_snapshots
+                """INSERT INTO analysis_snapshots
                    (prediction_date, model_version, lineup_status, created_at, payload_json)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(prediction_date, model_version, lineup_status) DO UPDATE SET
+                     created_at=excluded.created_at, payload_json=excluded.payload_json""",
                 (analysis["date"], model_version, snapshot_lineup_status, created_at, json.dumps(analysis, ensure_ascii=False)),
             )
             for game in eligible_games:
@@ -146,10 +148,15 @@ class PredictionStore:
                     "lineupConfirmed", analysis.get("lineupStatus") == "confirmed",
                 ) else "projected"
                 connection.execute(
-                    """INSERT OR IGNORE INTO game_predictions
+                    """INSERT INTO game_predictions
                        (prediction_date, game_id, model_version, lineup_status, created_at,
                         away_team, home_team, away_probability, home_probability, predicted_winner)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(prediction_date, game_id, model_version, lineup_status) DO UPDATE SET
+                         created_at=excluded.created_at,
+                         away_probability=excluded.away_probability,
+                         home_probability=excluded.home_probability,
+                         predicted_winner=excluded.predicted_winner""",
                     (
                         analysis["date"], game["id"], model_version, lineup_status, created_at,
                         game["away"], game["home"],
@@ -171,13 +178,30 @@ class PredictionStore:
                         else game.get("awayProbability", game["awayProb"] / 100)
                     )
                     connection.execute(
-                        """INSERT OR IGNORE INTO value_bet_predictions
+                        """INSERT INTO value_bet_predictions
                            (prediction_date, game_id, model_version, lineup_status, created_at,
                             favorite_team, underdog_team, underdog_odds, model_probability,
                             market_probability, expected_return, return_advantage, bookmaker,
                             bookmaker_count, market_age_minutes, market_quality_passed,
                             betting_open, market_updated_at, commence_at, recommended)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(prediction_date, game_id, model_version, lineup_status) DO UPDATE SET
+                             created_at=excluded.created_at,
+                             favorite_team=excluded.favorite_team,
+                             underdog_team=excluded.underdog_team,
+                             underdog_odds=excluded.underdog_odds,
+                             model_probability=excluded.model_probability,
+                             market_probability=excluded.market_probability,
+                             expected_return=excluded.expected_return,
+                             return_advantage=excluded.return_advantage,
+                             bookmaker=excluded.bookmaker,
+                             bookmaker_count=excluded.bookmaker_count,
+                             market_age_minutes=excluded.market_age_minutes,
+                             market_quality_passed=excluded.market_quality_passed,
+                             betting_open=excluded.betting_open,
+                             market_updated_at=excluded.market_updated_at,
+                             commence_at=excluded.commence_at,
+                             recommended=excluded.recommended""",
                         (
                             analysis["date"], game["id"], model_version, lineup_status, created_at,
                             value["favorite"]["team"], underdog["team"], underdog["odds"],
