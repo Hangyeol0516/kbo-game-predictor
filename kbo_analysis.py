@@ -15,7 +15,7 @@ import re
 import statistics
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -159,6 +159,22 @@ def _number(value: str, default: float = 0.0) -> float:
         return float(value.replace(",", ""))
     except (TypeError, ValueError):
         return default
+
+
+def _env_float(name: str, default: float, minimum: float | None = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(value, minimum) if minimum is not None else value
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(value, minimum) if minimum is not None else value
 
 
 def _get_text(url: str, opener=None) -> str:
@@ -330,10 +346,7 @@ def _odds_team_name(value: str) -> str | None:
 
 
 def _odds_cache_ttl() -> int:
-    try:
-        return max(int(os.environ.get("PLAYBALL_ODDS_CACHE_SECONDS", "3600")), 300)
-    except ValueError:
-        return 3600
+    return _env_int("PLAYBALL_ODDS_CACHE_SECONDS", 3600, 300)
 
 
 def odds_provider_status() -> dict[str, Any]:
@@ -374,7 +387,10 @@ def _parse_market_odds(raw: list[dict[str, Any]]) -> dict[str, dict[tuple[str, s
                 if team in fair_samples and price > 1:
                     prices[team] = price
                     if price > best.get(team, {}).get("price", 0):
-                        best[team] = {"price": price, "bookmaker": bookmaker.get("title") or bookmaker.get("key")}
+                        best[team] = {
+                            "price": price, "bookmaker": bookmaker.get("title") or bookmaker.get("key"),
+                            "lastUpdate": bookmaker.get("last_update"),
+                        }
             if away in prices and home in prices:
                 raw_away, raw_home = 1 / prices[away], 1 / prices[home]
                 total = raw_away + raw_home
@@ -389,6 +405,7 @@ def _parse_market_odds(raw: list[dict[str, Any]]) -> dict[str, dict[tuple[str, s
                 },
                 "bookmakerCount": min(len(fair_samples[away]), len(fair_samples[home])),
                 "lastUpdate": last_update,
+                "commenceTime": commence,
             }
     return dict(results_by_date)
 
@@ -689,6 +706,10 @@ def calibrate_probability(probability: float, calibrator: dict[str, Any] | None)
     return min(max(calibrated, 0.20), 0.80)
 
 
+def active_model_version() -> str:
+    return f"{BASE_MODEL_VERSION}+platt-v1" if load_calibrator() else BASE_MODEL_VERSION
+
+
 def _availability_context(
     team: str, hitter_stats: dict[tuple[str, str], dict[str, float]], roster_status: dict[str, Any],
 ) -> dict[str, Any]:
@@ -740,24 +761,57 @@ def evaluate_value_bet(
 
     favorite_metrics, underdog_metrics = metrics(favorite), metrics(underdog)
     advantage = underdog_metrics["expectedReturnValue"] - favorite_metrics["expectedReturnValue"]
-    min_ev = float(os.environ.get("PLAYBALL_UPSET_MIN_EV", "0.08"))
-    min_edge = float(os.environ.get("PLAYBALL_UPSET_MIN_EDGE", "0.05"))
-    min_advantage = float(os.environ.get("PLAYBALL_UPSET_MIN_ADVANTAGE", "0.10"))
+    min_ev = _env_float("PLAYBALL_UPSET_MIN_EV", 0.08)
+    min_edge = _env_float("PLAYBALL_UPSET_MIN_EDGE", 0.05)
+    min_advantage = _env_float("PLAYBALL_UPSET_MIN_ADVANTAGE", 0.10)
+    min_bookmakers = _env_int("PLAYBALL_ODDS_MIN_BOOKMAKERS", 2, 1)
+    max_age_minutes = _env_float("PLAYBALL_ODDS_MAX_AGE_MINUTES", 60, 1)
+    cutoff_minutes = _env_float("PLAYBALL_ODDS_CLOSE_BEFORE_MINUTES", 10, 0)
+    now = datetime.now(timezone.utc)
+
+    def parse_timestamp(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    price_updates = [parse_timestamp(teams[team].get("lastUpdate")) for team in (away, home)]
+    commence_at = parse_timestamp(market.get("commenceTime"))
+    age_minutes = (
+        max(max((now - updated_at).total_seconds() / 60, 0) for updated_at in price_updates)
+        if all(price_updates) else None
+    )
+    market_fresh = age_minutes is not None and age_minutes <= max_age_minutes
+    betting_open = commence_at is not None and now < commence_at - timedelta(minutes=cutoff_minutes)
+    bookmaker_count = int(market.get("bookmakerCount", 0))
     recommendation = (
         underdog_metrics["expectedReturnValue"] >= min_ev
         and underdog_metrics["modelProbabilityValue"] - underdog_metrics["marketProbabilityValue"] >= min_edge
         and advantage >= min_advantage
+        and bookmaker_count >= min_bookmakers
+        and market_fresh
+        and betting_open
     )
     return {
         "available": True, "recommendation": recommendation,
         "favorite": favorite_metrics, "underdog": underdog_metrics,
         "returnAdvantageValue": round(advantage, 6),
         "returnAdvantagePp": round(advantage * 100, 1),
-        "bookmakerCount": market.get("bookmakerCount", 0),
+        "bookmakerCount": bookmaker_count,
         "lastUpdate": market.get("lastUpdate"),
+        "commenceTime": market.get("commenceTime"),
+        "quality": {
+            "marketFresh": market_fresh, "ageMinutes": round(age_minutes, 1) if age_minutes is not None else None,
+            "bettingOpen": betting_open, "enoughBookmakers": bookmaker_count >= min_bookmakers,
+        },
         "criterion": {
             "minimumEvPct": min_ev * 100, "minimumEdgePp": min_edge * 100,
             "minimumAdvantagePp": min_advantage * 100,
+            "minimumBookmakers": min_bookmakers, "maximumAgeMinutes": max_age_minutes,
+            "closeBeforeMinutes": cutoff_minutes,
         },
     }
 
@@ -767,7 +821,7 @@ def _game_prediction(
     pitcher_stats: dict[tuple[str, str], dict[str, float]], bullpen_stats: dict[str, dict[str, Any]],
     hitter_stats: dict[tuple[str, str], dict[str, float]], roster_status: dict[str, Any],
     weather: dict[str, Any], market_odds: dict[str, Any] | None,
-    calibrator: dict[str, Any] | None,
+    calibrator: dict[str, Any] | None, lineup_confirmed: bool,
 ) -> dict[str, Any]:
     away_name, home_name = game["AWAY_NM"], game["HOME_NM"]
     away, home = team_stats[away_name], team_stats[home_name]
@@ -835,7 +889,8 @@ def _game_prediction(
         "awayProbability": round(1 - home_probability, 6),
         "homeProbability": round(home_probability, 6),
         "pick": pick, "confidence": confidence,
-        "lineupConfirmed": bool(game.get("LINEUP_CK")),
+        "lineupConfirmed": lineup_confirmed,
+        "snapshotEligible": str(game.get("GAME_STATE_SC")) == "1" and not bool(game.get("GAME_RESULT_CK")),
         "weather": weather, "availability": {"away": away_availability, "home": home_availability},
         "valueBet": value_bet,
         "reasons": [
@@ -928,18 +983,12 @@ class CacheEntry:
     value: dict[str, Any]
 
 
-_cache: dict[str, CacheEntry] = {}
+_cache: OrderedDict[str, CacheEntry] = OrderedDict()
 _cache_lock = threading.Lock()
+_inflight: dict[str, threading.Event] = {}
 
 
-def analyze(date: str, force: bool = False) -> dict[str, Any]:
-    compact_date = date.replace("-", "")
-    datetime.strptime(compact_date, "%Y%m%d")
-    with _cache_lock:
-        cached = _cache.get(compact_date)
-        if cached and not force and time.time() - cached.created < 600:
-            return cached.value
-
+def _analyze_uncached(date: str) -> dict[str, Any]:
     games = fetch_games(date)
     calibrator = load_calibrator()
     method_version = f"{BASE_MODEL_VERSION}+platt-v1" if calibrator else BASE_MODEL_VERSION
@@ -998,7 +1047,8 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
         game_predictions = [
             _game_prediction(
                 game, team_stats, pitcher_stats, bullpen_stats, hitter_stats, roster_status,
-                weather_by_game[game["G_ID"]], market_odds.get((game["AWAY_NM"], game["HOME_NM"])), calibrator,
+                weather_by_game[game["G_ID"]], market_odds.get((game["AWAY_NM"], game["HOME_NM"])),
+                calibrator, lineups[game["G_ID"]]["confirmed"],
             )
             for game in games
         ]
@@ -1022,10 +1072,53 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
             "methodVersion": method_version,
             "valueBetStatus": value_status, "odds": odds_state,
             "valueBets": [game["valueBet"] | {"gameId": game["id"], "away": game["away"], "home": game["home"]} for game in game_predictions if game["valueBet"].get("recommendation")],
-            "snapshotEligible": all(str(game.get("GAME_STATE_SC")) == "1" and not bool(game.get("GAME_RESULT_CK")) for game in games),
+            "snapshotEligible": any(game["snapshotEligible"] for game in game_predictions),
             "disclaimer": "공식 기록을 사용한 설명형 통계 추정치이며, 배당 기대수익은 수익을 보장하지 않습니다.",
         }
 
-    with _cache_lock:
-        _cache[compact_date] = CacheEntry(time.time(), result)
     return result
+
+
+def analyze(date: str, force: bool = False) -> dict[str, Any]:
+    """날짜별 분석을 단일 실행하고 완료 결과만 제한된 메모리 캐시에 저장한다."""
+    compact_date = date.replace("-", "")
+    datetime.strptime(compact_date, "%Y%m%d")
+    cache_ttl = _env_int("PLAYBALL_ANALYSIS_CACHE_SECONDS", 600, 30)
+    cache_limit = _env_int("PLAYBALL_ANALYSIS_CACHE_ENTRIES", 32, 1)
+
+    with _cache_lock:
+        cached = _cache.get(compact_date)
+        if cached and not force and time.time() - cached.created < cache_ttl:
+            _cache.move_to_end(compact_date)
+            return cached.value
+        event = _inflight.get(compact_date)
+        if event is None:
+            event = threading.Event()
+            _inflight[compact_date] = event
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        if not event.wait(timeout=120):
+            raise TimeoutError("같은 날짜의 분석이 아직 완료되지 않았습니다.")
+        with _cache_lock:
+            cached = _cache.get(compact_date)
+            if cached:
+                _cache.move_to_end(compact_date)
+                return cached.value
+        raise RuntimeError("같은 날짜의 분석이 완료되지 않았습니다.")
+
+    result: dict[str, Any] | None = None
+    try:
+        result = _analyze_uncached(date)
+        return result
+    finally:
+        with _cache_lock:
+            if result is not None:
+                _cache[compact_date] = CacheEntry(time.time(), result)
+                _cache.move_to_end(compact_date)
+                while len(_cache) > cache_limit:
+                    _cache.popitem(last=False)
+            _inflight.pop(compact_date, None)
+            event.set()

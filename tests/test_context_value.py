@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import kbo_analysis
@@ -42,13 +43,15 @@ class ContextValueTest(unittest.TestCase):
         self.assertEqual(_weather_run_factor(-10), 0.95)
 
     def test_underdog_is_recommended_only_for_sufficient_incremental_return(self):
+        updated_at = datetime.now(timezone.utc).isoformat()
         market = {
             "teams": {
-                "LG": {"price": 1.55, "bookmaker": "A", "marketProbability": 0.62},
-                "두산": {"price": 2.70, "bookmaker": "B", "marketProbability": 0.38},
+                "LG": {"price": 1.55, "bookmaker": "A", "marketProbability": 0.62, "lastUpdate": updated_at},
+                "두산": {"price": 2.70, "bookmaker": "B", "marketProbability": 0.38, "lastUpdate": updated_at},
             },
             "bookmakerCount": 4,
-            "lastUpdate": "2026-09-28T00:00:00Z",
+            "lastUpdate": updated_at,
+            "commenceTime": (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
         }
         with patch.dict("kbo_analysis.os.environ", {}, clear=False):
             value = evaluate_value_bet("LG", "두산", 0.54, 0.46, market)
@@ -56,9 +59,24 @@ class ContextValueTest(unittest.TestCase):
         self.assertEqual(value["underdog"]["team"], "두산")
         self.assertEqual(value["underdog"]["expectedReturnPct"], 24.2)
         self.assertGreater(value["returnAdvantagePp"], 10)
+        self.assertTrue(value["quality"]["marketFresh"])
+        self.assertTrue(value["quality"]["bettingOpen"])
 
         no_value = evaluate_value_bet("LG", "두산", 0.60, 0.40, market)
         self.assertFalse(no_value["recommendation"])
+
+        thin_market = {**market, "bookmakerCount": 1}
+        self.assertFalse(evaluate_value_bet("LG", "두산", 0.54, 0.46, thin_market)["recommendation"])
+
+        stale_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        stale_market = {
+            **market,
+            "teams": {team: {**metrics, "lastUpdate": stale_time} for team, metrics in market["teams"].items()},
+        }
+        self.assertFalse(evaluate_value_bet("LG", "두산", 0.54, 0.46, stale_market)["recommendation"])
+
+        closing_market = {**market, "commenceTime": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
+        self.assertFalse(evaluate_value_bet("LG", "두산", 0.54, 0.46, closing_market)["recommendation"])
 
     def test_missing_market_never_creates_an_upset_pick(self):
         value = evaluate_value_bet("LG", "두산", 0.4, 0.6, None)

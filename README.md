@@ -80,13 +80,16 @@ docker run -d \
 정배 대비 EV 우위  = 역배 EV - 정배 EV
 ```
 
-기본적으로 다음 세 조건을 모두 충족할 때만 `역배 PICK`으로 표시합니다.
+기본적으로 다음 조건을 모두 충족할 때만 `역배 PICK`으로 표시합니다.
 
 | 조건 | 기본값 |
 | --- | ---: |
 | 역배 기대수익 | 8% 이상 |
 | 시장 대비 모델 엣지 | 5%p 이상 |
 | 정배 대비 기대수익 우위 | 10%p 이상 |
+| 비교 북메이커 | 2곳 이상 |
+| 최고 배당 갱신 시각 | 60분 이내 |
+| 추천 마감 | 경기 시작 10분 전 |
 
 조건을 통과하지 못한 경기도 숨기지 않고 `NO BET`과 미달 기준을 표시합니다. 배당이 없거나 제공사 오류가 발생하면 임의의 값이나 오래된 배당으로 역배를 추천하지 않습니다.
 
@@ -97,9 +100,19 @@ docker run -d \
 | `PLAYBALL_ODDS_API_KEY` | 비어 있음 | The Odds API 키. 비어 있으면 역배 추천 비활성화 |
 | `PLAYBALL_ODDS_REGIONS` | `eu` | 조회할 북메이커 지역. 지역 수가 늘면 API 비용도 증가 가능 |
 | `PLAYBALL_ODDS_CACHE_SECONDS` | `3600` | 배당 전체 응답 캐시 시간. 최소 300초 |
+| `PLAYBALL_ODDS_MIN_BOOKMAKERS` | `2` | 추천에 필요한 최소 북메이커 수 |
+| `PLAYBALL_ODDS_MAX_AGE_MINUTES` | `60` | 최고 배당의 최대 허용 경과 시간 |
+| `PLAYBALL_ODDS_CLOSE_BEFORE_MINUTES` | `10` | 경기 시작 전 추천 마감 시간 |
 | `PLAYBALL_UPSET_MIN_EV` | `0.08` | 역배 최소 기대수익 |
 | `PLAYBALL_UPSET_MIN_EDGE` | `0.05` | 시장 대비 최소 확률 엣지 |
 | `PLAYBALL_UPSET_MIN_ADVANTAGE` | `0.10` | 정배 대비 최소 EV 우위 |
+| `PLAYBALL_ANALYSIS_CACHE_SECONDS` | `600` | 날짜별 분석 캐시 시간 |
+| `PLAYBALL_ANALYSIS_CACHE_ENTRIES` | `32` | 메모리에 보관할 최대 날짜 수 |
+| `PLAYBALL_MAX_CONCURRENT_ANALYSES` | `4` | 동시에 실행할 수 있는 분석 요청 수 |
+| `PLAYBALL_COLLECT_INTERVAL_SECONDS` | `900` | 스냅샷·결과 수집 간격 |
+| `PLAYBALL_COLLECTOR_ENABLED` | `1` | `0`이면 백그라운드 수집기 비활성화 |
+| `PLAYBALL_RESULT_LOOKBACK_DAYS` | `30` | 미정산 경기 결과를 다시 확인할 기간 |
+| `PLAYBALL_REFRESH_TOKEN` | 비어 있음 | 강제 갱신 헤더용 비밀값. 비어 있으면 강제 갱신 비활성화 |
 | `PLAYBALL_PORT` | `8000` | 호스트에 공개할 포트 |
 | `PLAYBALL_IMAGE_TAG` | `latest` | 실행할 GHCR 이미지 태그 |
 
@@ -114,8 +127,8 @@ docker run -d \
 - 좌투·우투·언더 유형별 타격 스플릿 기반 1안타 이상 확률
 - 실제 배당의 무마진 시장확률과 모델 확률 비교
 - 경기별 `역배 PICK / NO BET` 및 탈락 기준 표시
-- 예측 시점별 SQLite 스냅샷과 경기 종료 후 자동 채점
-- 적중률, Brier Score, 역배 실현 ROI 표시
+- 경기별 라인업 상태와 경기 상태를 보존하는 SQLite 스냅샷
+- 모델 버전별 적중률, Brier Score, 역배 실현 ROI 표시
 - 시간순 백테스트 데이터 내보내기
 - 검증 성능이 개선될 때만 활성화되는 Platt 확률 보정기
 
@@ -137,8 +150,9 @@ The Odds API ──┘             │
 | `/` | 웹 화면 |
 | `/health` | DB, 수집기, 배당 제공사와 캐시 상태 |
 | `/api/analysis?date=YYYY-MM-DD` | 해당 날짜의 경기·타자·역배 분석 |
-| `/api/analysis?date=YYYY-MM-DD&refresh=1` | 10분 분석 캐시를 건너뛰어 다시 분석 |
-| `/api/performance` | 저장된 예측의 적중률·Brier Score·역배 ROI |
+| `/api/analysis?date=YYYY-MM-DD&refresh=1` | `X-Refresh-Token`이 일치할 때만 분석 캐시 우회 |
+| `/api/performance` | 현재 활성 모델의 적중률·Brier Score·역배 ROI |
+| `/api/performance?modelVersion=all` | 모든 모델 버전을 합친 참고용 성능 |
 
 화면에 필요한 정적 파일 이외의 경로는 `404`를 반환합니다.
 
@@ -174,7 +188,14 @@ docker compose exec playball python scripts/backtest.py --db /data/playball.db
 docker compose exec playball python scripts/backtest.py \
   --db /data/playball.db \
   --export /data/evaluated_predictions.csv
+
+# 저장된 모든 배당 후보에서 역배 임계값 조합 탐색
+docker compose exec playball python scripts/evaluate_value_thresholds.py \
+  --db /data/playball.db \
+  --minimum-samples 20
 ```
+
+백테스트는 기본적으로 현재 기본 모델 버전만 평가합니다. 모든 과거 버전을 합치려면 `scripts/backtest.py`에 `--all-models`를 지정합니다. 임계값 탐색 결과는 같은 표본에서 과적합될 수 있으므로 반드시 이후 기간에서 다시 검증해야 합니다.
 
 종료 경기 100개 이상이 쌓이면 날짜 앞 80%를 학습, 뒤 20%를 검증에 사용해 Platt 보정기를 만들 수 있습니다. 검증 Brier Score가 개선되지 않으면 보정 파일을 생성하지 않습니다.
 

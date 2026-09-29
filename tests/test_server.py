@@ -1,9 +1,12 @@
+import json
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 
+import server
 from server import AppHandler
 
 
@@ -38,6 +41,44 @@ class StaticServerSecurityTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             urlopen(Request(f"{self.base_url}/.env", method="HEAD"), timeout=2)
         self.assertEqual(error.exception.code, 404)
+
+    def test_force_refresh_requires_a_token(self):
+        with patch.dict("server.os.environ", {}, clear=True), patch("server.analyze") as analyze:
+            with self.assertRaises(HTTPError) as error:
+                urlopen(f"{self.base_url}/api/analysis?date=2026-09-29&refresh=1", timeout=2)
+        self.assertEqual(error.exception.code, 403)
+        analyze.assert_not_called()
+
+    def test_force_refresh_accepts_the_configured_header(self):
+        payload = {"date": "2026-09-29", "games": [], "snapshotEligible": False}
+        request = Request(
+            f"{self.base_url}/api/analysis?date=2026-09-29&refresh=1",
+            headers={"X-Refresh-Token": "test-token"},
+        )
+        with (
+            patch.dict("server.os.environ", {"PLAYBALL_REFRESH_TOKEN": "test-token"}),
+            patch("server.analyze", return_value=payload) as analyze,
+            patch.object(server.STORE, "save_analysis"),
+        ):
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(json.load(response)["date"], "2026-09-29")
+        analyze.assert_called_once_with("2026-09-29", force=True)
+
+    def test_performance_read_does_not_synchronously_fetch_results(self):
+        payload = {"evaluatedGames": 0, "recent": [], "valueBet": {}}
+        with (
+            patch.object(server.STORE, "performance_summary", return_value=payload),
+            patch.object(server.STORE, "sync_results") as sync_results,
+        ):
+            with urlopen(f"{self.base_url}/api/performance", timeout=2) as response:
+                self.assertEqual(json.load(response)["evaluatedGames"], 0)
+        sync_results.assert_not_called()
+
+    def test_database_failure_makes_healthcheck_unready(self):
+        with patch.object(server.STORE, "connect", side_effect=OSError("unavailable")):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(f"{self.base_url}/health", timeout=2)
+        self.assertEqual(error.exception.code, 503)
 
 
 if __name__ == "__main__":

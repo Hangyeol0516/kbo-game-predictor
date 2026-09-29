@@ -22,6 +22,36 @@ jobs:
           python-version: "3.12"
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      - name: Compile Python sources
+        run: python -m compileall -q server.py kbo_analysis.py storage.py scripts tests
+      - name: Check browser JavaScript
+        run: node --check app.js
+      - name: Validate Compose configuration
+        run: docker compose config >/dev/null
+      - name: Build and smoke-test container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t playball:test .
+          docker run -d --name playball-smoke -e PLAYBALL_COLLECTOR_ENABLED=0 -p 127.0.0.1:18080:8000 playball:test
+          trap 'docker logs playball-smoke || true; docker rm -f playball-smoke >/dev/null 2>&1 || true' EXIT
+          python - <<'PY'
+          import json
+          import time
+          from urllib.request import urlopen
+
+          for _ in range(40):
+              try:
+                  with urlopen("http://127.0.0.1:18080/health", timeout=2) as response:
+                      payload = json.load(response)
+                  assert payload["status"] == "ok", payload
+                  break
+              except Exception:
+                  time.sleep(0.25)
+          else:
+              raise SystemExit("container did not become healthy")
+          PY
+          docker exec playball-smoke python scripts/backtest.py --help >/dev/null
 
   publish:
     needs: test

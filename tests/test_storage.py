@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -50,6 +51,37 @@ class PredictionStoreTest(unittest.TestCase):
         self.assertEqual(summary["valueBet"]["settled"], 1)
         self.assertEqual(summary["valueBet"]["wins"], 0)
         self.assertEqual(summary["valueBet"]["roi"], -100.0)
+        candidates = self.store.evaluated_value_candidates("stats-v4-matchup")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["underdog_team"], "LG")
+        self.assertEqual(self.store.performance_summary("other")["evaluatedGames"], 0)
+        self.assertEqual(self.store.value_bet_performance("other")["recommended"], 0)
+
+    def test_snapshot_eligibility_and_lineup_status_are_per_game(self):
+        analysis = {
+            "date": "2026-04-01", "updatedAt": "2026-04-01T17:00:00+09:00",
+            "methodVersion": "model-a", "lineupStatus": "projected", "snapshotEligible": True,
+            "games": [
+                {
+                    "id": "eligible", "away": "LG", "home": "두산", "awayProb": 40, "homeProb": 60,
+                    "awayProbability": 0.4, "homeProbability": 0.6, "pick": "두산",
+                    "lineupConfirmed": True, "snapshotEligible": True, "valueBet": {"available": False},
+                },
+                {
+                    "id": "finished", "away": "한화", "home": "삼성", "awayProb": 55, "homeProb": 45,
+                    "awayProbability": 0.55, "homeProbability": 0.45, "pick": "한화",
+                    "lineupConfirmed": False, "snapshotEligible": False, "valueBet": {"available": False},
+                },
+            ],
+        }
+        with patch("storage.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value.date.return_value.isoformat.return_value = "2026-04-01"
+            self.store.save_analysis(analysis)
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                "SELECT game_id, lineup_status FROM game_predictions ORDER BY game_id",
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("eligible", "confirmed")])
 
     def test_model_filter_is_applied_before_snapshot_ranking(self):
         with self.store.connect() as connection:
@@ -75,6 +107,24 @@ class PredictionStoreTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["model_version"], "wanted")
         self.assertEqual(rows[0]["home_probability"], 0.61)
+
+    def test_existing_database_gets_non_destructive_value_metadata_migration(self):
+        path = Path(self.temp_dir.name) / "legacy.db"
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """CREATE TABLE value_bet_predictions (
+                   id INTEGER PRIMARY KEY, prediction_date TEXT, game_id TEXT,
+                   model_version TEXT, lineup_status TEXT, created_at TEXT,
+                   favorite_team TEXT, underdog_team TEXT, underdog_odds REAL,
+                   model_probability REAL, market_probability REAL, expected_return REAL,
+                   return_advantage REAL, bookmaker TEXT, recommended INTEGER)"""
+            )
+        migrated = PredictionStore(str(path))
+        with migrated.connect() as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(value_bet_predictions)")}
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        self.assertTrue({"bookmaker_count", "market_age_minutes", "betting_open"}.issubset(columns))
+        self.assertEqual(version, 2)
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ function renderError(message) {
   document.querySelector("#hitterContent").innerHTML = `<div class="empty-state"><strong>선수 예측을 표시할 수 없습니다.</strong>실제 데이터가 없을 때는 샘플 값을 대신 보여주지 않습니다.</div>`;
   document.querySelector("#valueContent").innerHTML = `<div class="empty-state"><strong>배당 가치를 표시할 수 없습니다.</strong>불완전한 데이터로 역배를 추천하지 않습니다.</div>`;
   document.querySelector("#liveStatus").innerHTML = `<i></i> 연결 오류`;
-  document.querySelector("#retryButton")?.addEventListener("click", () => loadAnalysis(true));
+  document.querySelector("#retryButton")?.addEventListener("click", () => loadAnalysis());
 }
 
 function renderGames() {
@@ -95,6 +95,9 @@ function renderValueBets() {
     if (dog.expectedReturnPct < criterion.minimumEvPct) misses.push(`EV ${signed(criterion.minimumEvPct)} 미달`);
     if (dog.edgePp < criterion.minimumEdgePp) misses.push(`엣지 ${signed(criterion.minimumEdgePp, "%p")} 미달`);
     if (value.returnAdvantagePp < criterion.minimumAdvantagePp) misses.push(`정배 대비 ${signed(criterion.minimumAdvantagePp, "%p")} 미달`);
+    if (!value.quality?.enoughBookmakers) misses.push(`북메이커 ${criterion.minimumBookmakers}곳 미만`);
+    if (!value.quality?.marketFresh) misses.push(`배당 갱신 ${criterion.maximumAgeMinutes}분 초과`);
+    if (!value.quality?.bettingOpen) misses.push(`경기 ${criterion.closeBeforeMinutes}분 전 마감`);
     const verdict = value.recommendation ? "세 기준을 모두 충족해 정배 대신 선택할 가치가 있습니다." : `보류: ${misses.join(" · ")}`;
     return `<article class="value-card ${value.recommendation ? "recommended" : "no-bet"}">
       <div class="value-card-head"><span>${escapeHtml(game.away)} @ ${escapeHtml(game.home)}</span><strong>${value.recommendation ? "역배 PICK" : "NO BET"} · ${escapeHtml(dog.team)}</strong></div>
@@ -158,7 +161,7 @@ async function loadPerformance() {
         <b class="result-badge ${game.correct === true ? "correct" : game.correct === false ? "wrong" : "tie"}">${game.correct === true ? "적중" : game.correct === false ? "실패" : "무승부"}</b>
       </article>`).join("")}</div>` : `<div class="performance-empty"><strong>첫 채점을 기다리는 중입니다.</strong><p>${escapeHtml(data.message)}</p></div>`;
     container.innerHTML = `<div class="metric-grid">
-      <article><span>평가 경기</span><strong>${data.evaluatedGames}</strong><small>GAMES</small></article>
+      <article><span>평가 경기</span><strong>${data.evaluatedGames}</strong><small>${escapeHtml(data.modelVersion || "GAMES")}</small></article>
       <article><span>승패 적중률</span><strong>${metric(data.accuracy, "%")}</strong><small>${data.correctGames} / ${data.decidedGames}</small></article>
       <article><span>Brier Score</span><strong>${metric(data.brierScore)}</strong><small>낮을수록 정확</small></article>
       <article><span>역배 추천 / 적중</span><strong>${value.recommended} / ${value.wins}</strong><small>${value.settled}건 정산</small></article>
@@ -169,11 +172,11 @@ async function loadPerformance() {
   }
 }
 
-async function loadAnalysis(force = false) {
+async function loadAnalysis() {
   const requestId = ++state.requestId;
   state.loading = true; state.data = null; renderDate(); renderLoading(); renderFilters();
   try {
-    const response = await fetch(`/api/analysis?date=${toInputDate(state.date)}${force ? "&refresh=1" : ""}`);
+    const response = await fetch(`/api/analysis?date=${toInputDate(state.date)}`);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "알 수 없는 오류가 발생했습니다.");
     if (requestId !== state.requestId) return;

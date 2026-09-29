@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS value_bet_predictions (
     expected_return REAL NOT NULL,
     return_advantage REAL NOT NULL,
     bookmaker TEXT NOT NULL,
+    bookmaker_count INTEGER NOT NULL DEFAULT 1,
+    market_age_minutes REAL,
+    market_quality_passed INTEGER NOT NULL DEFAULT 1 CHECK (market_quality_passed IN (0, 1)),
+    betting_open INTEGER NOT NULL DEFAULT 1 CHECK (betting_open IN (0, 1)),
+    market_updated_at TEXT,
+    commence_at TEXT,
     recommended INTEGER NOT NULL CHECK (recommended IN (0, 1)),
     UNIQUE (prediction_date, game_id, model_version, lineup_status)
 );
@@ -84,6 +90,24 @@ class PredictionStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """기존 볼륨에 새 메타데이터 열을 비파괴 방식으로 추가한다."""
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(value_bet_predictions)")}
+        additions = {
+            "bookmaker_count": "INTEGER NOT NULL DEFAULT 1",
+            "market_age_minutes": "REAL",
+            "market_quality_passed": "INTEGER NOT NULL DEFAULT 1",
+            "betting_open": "INTEGER NOT NULL DEFAULT 1",
+            "market_updated_at": "TEXT",
+            "commence_at": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE value_bet_predictions ADD COLUMN {name} {definition}")
+        connection.execute("PRAGMA user_version=2")
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=15)
@@ -95,21 +119,32 @@ class PredictionStore:
     def save_analysis(self, analysis: dict[str, Any]) -> None:
         if (
             not analysis.get("games")
-            or not analysis.get("snapshotEligible")
             or analysis.get("date") != datetime.now(KST).date().isoformat()
         ):
             return
+        eligible_games = [
+            game for game in analysis["games"]
+            if game.get("snapshotEligible", analysis.get("snapshotEligible", False))
+        ]
+        if not eligible_games:
+            return
         created_at = analysis["updatedAt"]
         model_version = analysis["methodVersion"]
-        lineup_status = analysis.get("lineupStatus", "projected")
+        snapshot_lineup_status = "confirmed" if all(
+            game.get("lineupConfirmed", analysis.get("lineupStatus") == "confirmed")
+            for game in eligible_games
+        ) else "projected"
         with self.connect() as connection:
             connection.execute(
                 """INSERT OR IGNORE INTO analysis_snapshots
                    (prediction_date, model_version, lineup_status, created_at, payload_json)
                    VALUES (?, ?, ?, ?, ?)""",
-                (analysis["date"], model_version, lineup_status, created_at, json.dumps(analysis, ensure_ascii=False)),
+                (analysis["date"], model_version, snapshot_lineup_status, created_at, json.dumps(analysis, ensure_ascii=False)),
             )
-            for game in analysis["games"]:
+            for game in eligible_games:
+                lineup_status = "confirmed" if game.get(
+                    "lineupConfirmed", analysis.get("lineupStatus") == "confirmed",
+                ) else "projected"
                 connection.execute(
                     """INSERT OR IGNORE INTO game_predictions
                        (prediction_date, game_id, model_version, lineup_status, created_at,
@@ -125,6 +160,11 @@ class PredictionStore:
                 value = game.get("valueBet") or {}
                 if value.get("available"):
                     underdog = value["underdog"]
+                    quality = value.get("quality") or {}
+                    quality_passed = all((
+                        quality.get("marketFresh", True), quality.get("bettingOpen", True),
+                        quality.get("enoughBookmakers", True),
+                    ))
                     model_probability = (
                         game.get("homeProbability", game["homeProb"] / 100)
                         if underdog["team"] == game["home"]
@@ -134,8 +174,10 @@ class PredictionStore:
                         """INSERT OR IGNORE INTO value_bet_predictions
                            (prediction_date, game_id, model_version, lineup_status, created_at,
                             favorite_team, underdog_team, underdog_odds, model_probability,
-                            market_probability, expected_return, return_advantage, bookmaker, recommended)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            market_probability, expected_return, return_advantage, bookmaker,
+                            bookmaker_count, market_age_minutes, market_quality_passed,
+                            betting_open, market_updated_at, commence_at, recommended)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             analysis["date"], game["id"], model_version, lineup_status, created_at,
                             value["favorite"]["team"], underdog["team"], underdog["odds"],
@@ -143,19 +185,27 @@ class PredictionStore:
                             underdog.get("marketProbabilityValue", underdog["marketProbability"] / 100),
                             underdog.get("expectedReturnValue", underdog["expectedReturnPct"] / 100),
                             value.get("returnAdvantageValue", value["returnAdvantagePp"] / 100),
-                            underdog["bookmaker"], int(value["recommendation"]),
+                            underdog["bookmaker"], int(value.get("bookmakerCount", 0)),
+                            quality.get("ageMinutes"), int(quality_passed),
+                            int(quality.get("bettingOpen", True)),
+                            value.get("lastUpdate"), value.get("commenceTime"), int(value["recommendation"]),
                         ),
                     )
 
     def pending_dates(self) -> list[str]:
+        today = datetime.now(KST).date()
+        try:
+            lookback_days = max(int(os.environ.get("PLAYBALL_RESULT_LOOKBACK_DAYS", "30")), 1)
+        except ValueError:
+            lookback_days = 30
         with self.connect() as connection:
             rows = connection.execute(
                 """SELECT DISTINCT p.prediction_date
                    FROM game_predictions p
                    LEFT JOIN game_results r ON r.game_id = p.game_id
-                   WHERE r.game_id IS NULL AND p.prediction_date <= ?
+                   WHERE r.game_id IS NULL AND p.prediction_date BETWEEN ? AND ?
                    ORDER BY p.prediction_date""",
-                (datetime.now(KST).date().isoformat(),),
+                ((today - timedelta(days=lookback_days)).isoformat(), today.isoformat()),
             ).fetchall()
         return [row[0] for row in rows]
 
@@ -217,14 +267,14 @@ class PredictionStore:
             rows = connection.execute(query, (model_version, model_version)).fetchall()
         return [dict(row) for row in rows]
 
-    def performance_summary(self) -> dict[str, Any]:
-        rows = self.evaluated_predictions()
+    def performance_summary(self, model_version: str | None = None) -> dict[str, Any]:
+        rows = self.evaluated_predictions(model_version)
         decided = [row for row in rows if row["winner"] is not None]
         correct = sum(row["predicted_winner"] == row["winner"] for row in decided)
-        brier_values = []
-        for row in rows:
-            outcome = 0.5 if row["winner"] is None else float(row["winner"] == row["home_team"])
-            brier_values.append((row["home_probability"] - outcome) ** 2)
+        brier_values = [
+            (row["home_probability"] - float(row["winner"] == row["home_team"])) ** 2
+            for row in decided
+        ]
         recent = []
         for row in reversed(rows[-10:]):
             recent.append({
@@ -240,11 +290,12 @@ class PredictionStore:
             "accuracy": round(correct / len(decided) * 100, 1) if decided else None,
             "brierScore": round(sum(brier_values) / len(brier_values), 4) if brier_values else None,
             "recent": recent,
-            "valueBet": self.value_bet_performance(),
+            "modelVersion": model_version or "all",
+            "valueBet": self.value_bet_performance(model_version),
             "message": None if rows else "저장된 예측의 경기가 종료되면 성능 지표가 표시됩니다.",
         }
 
-    def value_bet_performance(self) -> dict[str, Any]:
+    def value_bet_performance(self, model_version: str | None = None) -> dict[str, Any]:
         query = """
         WITH ranked AS (
           SELECT v.*,
@@ -254,6 +305,7 @@ class PredictionStore:
                  ) AS choice
           FROM value_bet_predictions v
           WHERE v.recommended = 1
+            AND (? IS NULL OR v.model_version = ?)
         )
         SELECT v.prediction_date, v.game_id, v.underdog_team, v.underdog_odds,
                v.expected_return, v.bookmaker, r.winner
@@ -263,7 +315,7 @@ class PredictionStore:
         ORDER BY v.prediction_date, v.game_id
         """
         with self.connect() as connection:
-            rows = connection.execute(query).fetchall()
+            rows = connection.execute(query, (model_version, model_version)).fetchall()
         settled = [row for row in rows if row["winner"] is not None]
         profit = sum(
             row["underdog_odds"] - 1 if row["winner"] == row["underdog_team"] else -1
@@ -275,6 +327,32 @@ class PredictionStore:
             "profitUnits": round(profit, 3),
             "roi": round(profit / len(settled) * 100, 1) if settled else None,
         }
+
+    def evaluated_value_candidates(self, model_version: str | None = None) -> list[dict[str, Any]]:
+        """추천 여부와 무관하게 저장된 배당 후보를 경기당 가장 신뢰할 시점으로 평가한다."""
+        query = """
+        WITH ranked AS (
+          SELECT v.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY v.game_id
+                   ORDER BY CASE v.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, v.created_at DESC
+                 ) AS choice
+          FROM value_bet_predictions v
+          WHERE (? IS NULL OR v.model_version = ?)
+        )
+        SELECT v.prediction_date, v.game_id, v.model_version, v.lineup_status,
+               v.underdog_team, v.underdog_odds, v.model_probability,
+               v.market_probability, v.expected_return, v.return_advantage,
+               v.bookmaker, v.bookmaker_count, v.market_age_minutes,
+               v.market_quality_passed, v.betting_open, v.market_updated_at, v.commence_at, r.winner
+        FROM ranked v
+        JOIN game_results r ON r.game_id = v.game_id
+        WHERE v.choice = 1
+        ORDER BY v.prediction_date, v.game_id
+        """
+        with self.connect() as connection:
+            rows = connection.execute(query, (model_version, model_version)).fetchall()
+        return [dict(row) for row in rows]
 
 
 def _iso_game_date(value: str) -> str:

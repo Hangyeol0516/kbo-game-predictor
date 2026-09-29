@@ -49,6 +49,12 @@ CREATE TABLE value_bet_predictions (
     expected_return NUMERIC(8,5) NOT NULL,
     return_advantage NUMERIC(8,5) NOT NULL,
     bookmaker TEXT NOT NULL,
+    bookmaker_count SMALLINT NOT NULL DEFAULT 1 CHECK (bookmaker_count >= 0),
+    market_age_minutes NUMERIC(8,2),
+    market_quality_passed BOOLEAN NOT NULL DEFAULT TRUE,
+    betting_open BOOLEAN NOT NULL DEFAULT TRUE,
+    market_updated_at TIMESTAMPTZ,
+    commence_at TIMESTAMPTZ,
     recommended BOOLEAN NOT NULL,
     UNIQUE (prediction_date, game_id, model_version, lineup_status)
 );
