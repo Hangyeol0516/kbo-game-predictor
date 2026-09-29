@@ -93,7 +93,7 @@ class ContextValueTest(unittest.TestCase):
         with patch.dict("kbo_analysis.os.environ", {
             "PLAYBALL_ODDS_API_KEY": "secret", "PLAYBALL_ODDS_REGIONS": "eu",
         }):
-            self.assertEqual(fetch_market_odds("2026-09-28"), {})
+            self.assertEqual(fetch_market_odds("2026-09-28", refresh=True), {})
             self.assertEqual(odds_provider_status()["lastError"], "RuntimeError")
 
     @patch("kbo_analysis._get_json_response")
@@ -117,8 +117,10 @@ class ContextValueTest(unittest.TestCase):
         with patch.dict("kbo_analysis.os.environ", {
             "PLAYBALL_ODDS_API_KEY": "secret", "PLAYBALL_ODDS_REGIONS": "eu",
         }):
-            market = fetch_market_odds("2026-09-28")[("LG", "두산")]
+            self.assertEqual(fetch_market_odds("2026-09-28"), {})
+            market = fetch_market_odds("2026-09-28", refresh=True)[("LG", "두산")]
             self.assertEqual(fetch_market_odds("2026-09-29"), {})
+            refreshed = fetch_market_odds("2026-09-28", refresh=True)
             status = odds_provider_status()
         self.assertEqual(market["teams"]["LG"]["price"], 1.75)
         self.assertEqual(market["teams"]["LG"]["bookmaker"], "Book B")
@@ -128,7 +130,8 @@ class ContextValueTest(unittest.TestCase):
             + market["teams"]["두산"]["marketProbability"],
             1.0,
         )
-        self.assertEqual(get_json_response.call_count, 1)
+        self.assertEqual(refreshed[("LG", "두산")]["teams"]["LG"]["price"], 1.75)
+        self.assertEqual(get_json_response.call_count, 2)
         self.assertEqual(status["creditsRemaining"], 499.0)
         self.assertEqual(status["eventCount"], 1)
 

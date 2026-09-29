@@ -345,18 +345,12 @@ def _odds_team_name(value: str) -> str | None:
     return next((team for alias, team in ODDS_TEAM_NAMES.items() if alias in normalized), None)
 
 
-def _odds_cache_ttl() -> int:
-    return _env_int("PLAYBALL_ODDS_CACHE_SECONDS", 3600, 300)
-
-
 def odds_provider_status() -> dict[str, Any]:
-    ttl = _odds_cache_ttl()
     with _odds_lock:
         age = time.time() - float(_odds_cache["created"])
         return {
             "configured": bool(os.environ.get("PLAYBALL_ODDS_API_KEY", "").strip()),
             "regions": os.environ.get("PLAYBALL_ODDS_REGIONS", "eu"),
-            "cacheTtlSeconds": ttl,
             "cacheAgeSeconds": round(age) if _odds_cache["created"] else None,
             **_odds_state,
         }
@@ -410,32 +404,37 @@ def _parse_market_odds(raw: list[dict[str, Any]]) -> dict[str, dict[tuple[str, s
     return dict(results_by_date)
 
 
-def fetch_market_odds(date: str) -> dict[tuple[str, str], dict[str, Any]]:
-    """북메이커별 moneyline을 정규화하고 1시간 캐시로 API 쿼터를 보호한다."""
+def fetch_market_odds(date: str, refresh: bool = False) -> dict[tuple[str, str], dict[str, Any]]:
+    """북메이커별 moneyline을 정규화하고 공유 캐시로 API 쿼터를 보호한다.
+
+    평상시에는 컨테이너가 보유한 마지막 전체 응답을 재사용한다. 백그라운드
+    수집기가 경기 일정에 맞는 시점에만 ``refresh``를 요청한다.
+    """
     api_key = os.environ.get("PLAYBALL_ODDS_API_KEY", "").strip()
     if not api_key:
         return {}
     regions = os.environ.get("PLAYBALL_ODDS_REGIONS", "eu")
     credential = hashlib.sha256(api_key.encode()).hexdigest()[:12]
-    ttl = _odds_cache_ttl()
     with _odds_lock:
-        cache_valid = (
+        cache_matches = (
             _odds_cache["regions"] == regions
             and _odds_cache["credential"] == credential
-            and time.time() - _odds_cache["created"] < ttl
+            and bool(_odds_cache["created"])
         )
-        if cache_valid:
+        if cache_matches and not refresh:
             return _odds_cache["eventsByDate"].get(date, {})
+        if not refresh:
+            return {}
 
     # 네트워크 호출만 직렬화하고 상태 조회와 헬스체크는 막지 않는다.
     with _odds_fetch_lock:
         with _odds_lock:
-            cache_valid = (
+            cache_matches = (
                 _odds_cache["regions"] == regions
                 and _odds_cache["credential"] == credential
-                and time.time() - _odds_cache["created"] < ttl
+                and bool(_odds_cache["created"])
             )
-            if cache_valid:
+            if cache_matches and not refresh:
                 return _odds_cache["eventsByDate"].get(date, {})
         query = urlencode({
             "apiKey": api_key, "regions": regions, "markets": "h2h",
@@ -988,7 +987,7 @@ _cache_lock = threading.Lock()
 _inflight: dict[str, threading.Event] = {}
 
 
-def _analyze_uncached(date: str) -> dict[str, Any]:
+def _analyze_uncached(date: str, refresh_odds: bool = False) -> dict[str, Any]:
     games = fetch_games(date)
     calibrator = load_calibrator()
     method_version = f"{BASE_MODEL_VERSION}+platt-v1" if calibrator else BASE_MODEL_VERSION
@@ -1018,7 +1017,7 @@ def _analyze_uncached(date: str) -> dict[str, Any]:
             matchup_future = executor.submit(fetch_matchup_hitter_stats, team_splits)
             roster_future = executor.submit(fetch_roster_status, date)
             weather_future = executor.submit(fetch_game_weathers, games, date)
-            odds_future = executor.submit(fetch_market_odds, date)
+            odds_future = executor.submit(fetch_market_odds, date, refresh_odds)
             lineup_results = [future.result() for future in lineup_futures]
             hitter_stats = hitter_future.result()
             pitcher_stats = pitcher_future.result()
@@ -1079,7 +1078,7 @@ def _analyze_uncached(date: str) -> dict[str, Any]:
     return result
 
 
-def analyze(date: str, force: bool = False) -> dict[str, Any]:
+def analyze(date: str, force: bool = False, refresh_odds: bool = False) -> dict[str, Any]:
     """날짜별 분석을 단일 실행하고 완료 결과만 제한된 메모리 캐시에 저장한다."""
     compact_date = date.replace("-", "")
     datetime.strptime(compact_date, "%Y%m%d")
@@ -1088,7 +1087,7 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
 
     with _cache_lock:
         cached = _cache.get(compact_date)
-        if cached and not force and time.time() - cached.created < cache_ttl:
+        if cached and not force and not refresh_odds and time.time() - cached.created < cache_ttl:
             _cache.move_to_end(compact_date)
             return cached.value
         event = _inflight.get(compact_date)
@@ -1111,7 +1110,7 @@ def analyze(date: str, force: bool = False) -> dict[str, Any]:
 
     result: dict[str, Any] | None = None
     try:
-        result = _analyze_uncached(date)
+        result = _analyze_uncached(date, refresh_odds=True) if refresh_odds else _analyze_uncached(date)
         return result
     finally:
         with _cache_lock:

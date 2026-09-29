@@ -27,7 +27,11 @@ def env_int(name: str, default: int, minimum: int) -> int:
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STORE = PredictionStore()
 KST = timezone(timedelta(hours=9))
-COLLECTOR_STATE = {"lastRun": None, "lastAnalysis": None, "lastResultSync": None, "lastError": None}
+COLLECTOR_STATE = {
+    "lastRun": None, "lastAnalysis": None, "lastResultSync": None,
+    "lastOddsSlot": None, "lastError": None,
+}
+COLLECTOR_ODDS_SLOTS: dict[str, str] = {}
 STATIC_PATHS = {"/", "/index.html", "/app.js", "/styles.css"}
 ANALYSIS_SLOTS = threading.BoundedSemaphore(env_int("PLAYBALL_MAX_CONCURRENT_ANALYSES", 4, 1))
 
@@ -83,7 +87,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not ANALYSIS_SLOTS.acquire(blocking=False):
                 return self.send_json({"error": "분석 요청이 많습니다. 잠시 후 다시 시도해 주세요."}, 429)
             try:
-                analysis = analyze(date, force=force)
+                analysis = analyze(date, force=force, refresh_odds=force)
                 STORE.save_analysis(analysis)
                 return self.send_json(analysis)
             except Exception as exc:
@@ -123,6 +127,41 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _game_start_times(games: list[dict], now: datetime) -> list[datetime]:
+    starts = []
+    for game in games:
+        state = game.get("GAME_STATE_SC")
+        if bool(game.get("GAME_RESULT_CK")) or (state is not None and str(state) != "1"):
+            continue
+        try:
+            hour, minute = map(int, str(game.get("G_TM", "")).strip()[:5].split(":"))
+            starts.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
+        except (TypeError, ValueError):
+            continue
+    return sorted(starts)
+
+
+def collector_odds_slot(games: list[dict], now: datetime) -> str | None:
+    """현재 시각까지 도달한 가장 최근 배당 수집 슬롯을 반환한다."""
+    starts = _game_start_times(games, now)
+    if not starts or now >= starts[0]:
+        return None
+    slots = (
+        ("morning", now.replace(hour=9, minute=0, second=0, microsecond=0)),
+        ("pregame", starts[0] - timedelta(hours=3)),
+        ("closing", starts[0] - timedelta(minutes=30)),
+    )
+    due = [name for name, scheduled_at in slots if now >= scheduled_at]
+    return due[-1] if due else None
+
+
+def collector_analysis_due(games: list[dict], now: datetime) -> bool:
+    """경기가 있는 날 오전 9시부터 첫 경기 시작 전까지만 분석한다."""
+    starts = _game_start_times(games, now)
+    morning = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    return bool(starts and morning <= now < starts[0])
+
+
 def background_collector() -> None:
     """페이지 방문 여부와 무관하게 경기 전 스냅샷과 종료 결과를 수집한다."""
     interval = env_int("PLAYBALL_COLLECT_INTERVAL_SECONDS", 900, 60)
@@ -130,9 +169,21 @@ def background_collector() -> None:
         errors = []
         now = datetime.now(KST)
         today = now.date().isoformat()
-        if 9 <= now.hour < 20:
+        try:
+            games = fetch_games(today)
+        except Exception as exc:
+            games = []
+            errors.append(f"schedule: {type(exc).__name__}")
+            print(f"background schedule failed: {exc}", flush=True)
+        if collector_analysis_due(games, now):
+            odds_slot = collector_odds_slot(games, now)
+            refresh_odds = bool(odds_slot and COLLECTOR_ODDS_SLOTS.get(today) != odds_slot)
             try:
-                STORE.save_analysis(analyze(today))
+                STORE.save_analysis(analyze(today, force=True, refresh_odds=refresh_odds))
+                if refresh_odds:
+                    COLLECTOR_ODDS_SLOTS.clear()
+                    COLLECTOR_ODDS_SLOTS[today] = odds_slot
+                    COLLECTOR_STATE["lastOddsSlot"] = f"{today}:{odds_slot}"
                 COLLECTOR_STATE["lastAnalysis"] = datetime.now(KST).isoformat(timespec="seconds")
             except Exception as exc:
                 errors.append(f"analysis: {type(exc).__name__}")

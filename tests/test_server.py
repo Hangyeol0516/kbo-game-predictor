@@ -1,6 +1,7 @@
 import json
 import threading
 import unittest
+from datetime import datetime
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -62,7 +63,7 @@ class StaticServerSecurityTest(unittest.TestCase):
         ):
             with urlopen(request, timeout=2) as response:
                 self.assertEqual(json.load(response)["date"], "2026-09-29")
-        analyze.assert_called_once_with("2026-09-29", force=True)
+        analyze.assert_called_once_with("2026-09-29", force=True, refresh_odds=True)
 
     def test_performance_read_does_not_synchronously_fetch_results(self):
         payload = {"evaluatedGames": 0, "recent": [], "valueBet": {}}
@@ -79,6 +80,40 @@ class StaticServerSecurityTest(unittest.TestCase):
             with self.assertRaises(HTTPError) as error:
                 urlopen(f"{self.base_url}/health", timeout=2)
         self.assertEqual(error.exception.code, 503)
+
+
+class CollectorScheduleTest(unittest.TestCase):
+    games = [{"G_TM": "18:30", "GAME_RESULT_CK": 0}]
+
+    def at(self, hour, minute=0):
+        return datetime(2026, 9, 29, hour, minute, tzinfo=server.KST)
+
+    def test_skips_days_without_games_and_hours_before_morning(self):
+        self.assertIsNone(server.collector_odds_slot([], self.at(10)))
+        self.assertIsNone(server.collector_odds_slot(self.games, self.at(8, 59)))
+        self.assertFalse(server.collector_analysis_due([], self.at(10)))
+        self.assertFalse(server.collector_analysis_due(self.games, self.at(8, 59)))
+
+    def test_uses_three_schedule_relative_odds_slots(self):
+        self.assertEqual(server.collector_odds_slot(self.games, self.at(9)), "morning")
+        self.assertEqual(server.collector_odds_slot(self.games, self.at(15, 30)), "pregame")
+        self.assertEqual(server.collector_odds_slot(self.games, self.at(18)), "closing")
+
+    def test_stops_analysis_and_odds_refresh_at_first_pitch(self):
+        self.assertTrue(server.collector_analysis_due(self.games, self.at(18, 29)))
+        self.assertFalse(server.collector_analysis_due(self.games, self.at(18, 30)))
+        self.assertIsNone(server.collector_odds_slot(self.games, self.at(18, 30)))
+
+    def test_uses_earliest_start_when_game_times_differ(self):
+        games = self.games + [{"G_TM": "14:00", "GAME_RESULT_CK": 0}]
+        self.assertEqual(server.collector_odds_slot(games, self.at(13, 30)), "closing")
+        self.assertIsNone(server.collector_odds_slot(games, self.at(14)))
+
+    def test_ignores_cancelled_and_completed_games(self):
+        cancelled = [{"G_TM": "18:30", "GAME_RESULT_CK": 0, "GAME_STATE_SC": 4}]
+        completed = [{"G_TM": "18:30", "GAME_RESULT_CK": 1, "GAME_STATE_SC": 1}]
+        self.assertIsNone(server.collector_odds_slot(cancelled, self.at(10)))
+        self.assertFalse(server.collector_analysis_due(completed, self.at(10)))
 
 
 if __name__ == "__main__":
