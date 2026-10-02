@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from kbo_analysis import BASE_MODEL_VERSION  # noqa: E402
+from kbo_analysis import BASE_MODEL_VERSION, calibrate_probability  # noqa: E402
 from storage import PredictionStore  # noqa: E402
 
 
@@ -63,7 +63,7 @@ def main() -> None:
     validation_p = [row["home_probability"] for row in validation]
     validation_y = [float(row["winner"] == row["home_team"]) for row in validation]
     calibrated_p = [
-        sigmoid(slope * math.log(min(max(p, 0.001), 0.999) / (1 - min(max(p, 0.001), 0.999))) + intercept)
+        calibrate_probability(p, {"slope": slope, "intercept": intercept})
         for p in validation_p
     ]
     baseline_brier = brier(validation_p, validation_y)

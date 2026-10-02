@@ -17,6 +17,7 @@ import threading
 import time
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -459,6 +460,7 @@ def fetch_market_odds(date: str, refresh: bool = False) -> dict[tuple[str, str],
         except Exception as exc:
             error_name = f"HTTP {exc.code}" if isinstance(exc, HTTPError) else type(exc).__name__
             with _odds_lock:
+                _odds_cache.update({"created": 0.0, "eventsByDate": {}})
                 _odds_state.update({"lastError": error_name, "lastFetch": datetime.now(KST).isoformat(timespec="seconds")})
                 return {}
         return events_by_date.get(date, {})
@@ -755,6 +757,7 @@ def evaluate_value_bet(
             "marketProbability": round(market_probability * 100, 1),
             "edgePp": round((model[team] - market_probability) * 100, 1),
             "odds": round(price, 2), "bookmaker": teams[team]["bookmaker"],
+            "lastUpdate": teams[team].get("lastUpdate"),
             "expectedReturnPct": round(expected_return * 100, 1),
         }
 
@@ -766,46 +769,15 @@ def evaluate_value_bet(
     min_bookmakers = _env_int("PLAYBALL_ODDS_MIN_BOOKMAKERS", 2, 1)
     max_age_minutes = _env_float("PLAYBALL_ODDS_MAX_AGE_MINUTES", 60, 1)
     cutoff_minutes = _env_float("PLAYBALL_ODDS_CLOSE_BEFORE_MINUTES", 10, 0)
-    now = datetime.now(timezone.utc)
-
-    def parse_timestamp(value: str | None) -> datetime | None:
-        if not value:
-            return None
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
-
-    price_updates = [parse_timestamp(teams[team].get("lastUpdate")) for team in (away, home)]
-    commence_at = parse_timestamp(market.get("commenceTime"))
-    age_minutes = (
-        max(max((now - updated_at).total_seconds() / 60, 0) for updated_at in price_updates)
-        if all(price_updates) else None
-    )
-    market_fresh = age_minutes is not None and age_minutes <= max_age_minutes
-    betting_open = commence_at is not None and now < commence_at - timedelta(minutes=cutoff_minutes)
     bookmaker_count = int(market.get("bookmakerCount", 0))
-    recommendation = (
-        underdog_metrics["expectedReturnValue"] >= min_ev
-        and underdog_metrics["modelProbabilityValue"] - underdog_metrics["marketProbabilityValue"] >= min_edge
-        and advantage >= min_advantage
-        and bookmaker_count >= min_bookmakers
-        and market_fresh
-        and betting_open
-    )
-    return {
-        "available": True, "recommendation": recommendation,
+    value = {
+        "available": True,
         "favorite": favorite_metrics, "underdog": underdog_metrics,
         "returnAdvantageValue": round(advantage, 6),
         "returnAdvantagePp": round(advantage * 100, 1),
         "bookmakerCount": bookmaker_count,
         "lastUpdate": market.get("lastUpdate"),
         "commenceTime": market.get("commenceTime"),
-        "quality": {
-            "marketFresh": market_fresh, "ageMinutes": round(age_minutes, 1) if age_minutes is not None else None,
-            "bettingOpen": betting_open, "enoughBookmakers": bookmaker_count >= min_bookmakers,
-        },
         "criterion": {
             "minimumEvPct": min_ev * 100, "minimumEdgePp": min_edge * 100,
             "minimumAdvantagePp": min_advantage * 100,
@@ -813,6 +785,79 @@ def evaluate_value_bet(
             "closeBeforeMinutes": cutoff_minutes,
         },
     }
+    _update_value_bet_quality(value, datetime.now(timezone.utc))
+    return value
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _update_value_bet_quality(value: dict[str, Any], now: datetime) -> None:
+    """통계 캐시를 유지하면서 배당의 유효성과 추천 여부는 현재 시각으로 판정한다."""
+    criterion = value["criterion"]
+    price_updates = [_parse_timestamp(value[side].get("lastUpdate")) for side in ("favorite", "underdog")]
+    commence_at = _parse_timestamp(value.get("commenceTime"))
+    age_minutes = (
+        max(max((now - updated_at).total_seconds() / 60, 0) for updated_at in price_updates)
+        if all(price_updates) else None
+    )
+    quality = {
+        "marketFresh": age_minutes is not None and age_minutes <= criterion["maximumAgeMinutes"],
+        "ageMinutes": round(age_minutes, 1) if age_minutes is not None else None,
+        "bettingOpen": commence_at is not None and now < commence_at - timedelta(minutes=criterion["closeBeforeMinutes"]),
+        "enoughBookmakers": value["bookmakerCount"] >= criterion["minimumBookmakers"],
+    }
+    dog = value["underdog"]
+    value["quality"] = quality
+    value["recommendation"] = (
+        dog["expectedReturnValue"] >= criterion["minimumEvPct"] / 100
+        and dog["modelProbabilityValue"] - dog["marketProbabilityValue"] >= criterion["minimumEdgePp"] / 100
+        and value["returnAdvantageValue"] >= criterion["minimumAdvantagePp"] / 100
+        and quality["marketFresh"] and quality["bettingOpen"] and quality["enoughBookmakers"]
+    )
+
+
+def _current_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
+    """공유 캐시를 변경하지 않고 응답 시점의 시간 의존 필드를 갱신한다."""
+    result = deepcopy(analysis)
+    now = datetime.now(timezone.utc)
+    odds_state = odds_provider_status()
+    provider_failed = odds_state["configured"] and bool(odds_state["lastError"])
+    provider_disabled = not odds_state["configured"]
+    for game in result.get("games", []):
+        starts_at = _parse_timestamp(game.get("startsAt"))
+        if "startsAt" in game and (starts_at is None or now >= starts_at):
+            game["snapshotEligible"] = False
+        value = game.get("valueBet") or {}
+        if value.get("available"):
+            if provider_failed or provider_disabled:
+                game["valueBet"] = {
+                    "available": False, "recommendation": False,
+                    "reason": "배당 제공사 오류" if provider_failed else "배당 미연결",
+                }
+            else:
+                _update_value_bet_quality(value, now)
+    if "snapshotEligible" in result:
+        result["snapshotEligible"] = any(game.get("snapshotEligible", False) for game in result["games"])
+    if "odds" in result:
+        result["odds"] = odds_state
+    if "valueBetStatus" in result and provider_failed:
+        result["valueBetStatus"] = "provider-error"
+    elif "valueBetStatus" in result and provider_disabled:
+        result["valueBetStatus"] = "not-configured"
+    if "valueBets" in result:
+        result["valueBets"] = [
+            game["valueBet"] | {"gameId": game["id"], "away": game["away"], "home": game["home"]}
+            for game in result["games"] if (game.get("valueBet") or {}).get("recommendation")
+        ]
+    return result
 
 
 def _game_prediction(
@@ -1051,6 +1096,12 @@ def _analyze_uncached(date: str, refresh_odds: bool = False) -> dict[str, Any]:
             )
             for game in games
         ]
+        for game in game_predictions:
+            try:
+                starts_at = datetime.fromisoformat(f"{date}T{str(game['time']).strip()[:5]}").replace(tzinfo=KST)
+                game["startsAt"] = starts_at.isoformat(timespec="seconds")
+            except ValueError:
+                game["startsAt"] = None
         hitter_predictions, all_confirmed = _hitter_predictions(
             games, lineups, hitter_stats, team_stats, pitcher_stats, pitcher_hands, matchup_hitter_stats, roster_status,
         )
@@ -1089,7 +1140,7 @@ def analyze(date: str, force: bool = False, refresh_odds: bool = False) -> dict[
         cached = _cache.get(compact_date)
         if cached and not force and not refresh_odds and time.time() - cached.created < cache_ttl:
             _cache.move_to_end(compact_date)
-            return cached.value
+            return _current_analysis(cached.value)
         event = _inflight.get(compact_date)
         if event is None:
             event = threading.Event()
@@ -1105,13 +1156,13 @@ def analyze(date: str, force: bool = False, refresh_odds: bool = False) -> dict[
             cached = _cache.get(compact_date)
             if cached:
                 _cache.move_to_end(compact_date)
-                return cached.value
+                return _current_analysis(cached.value)
         raise RuntimeError("같은 날짜의 분석이 완료되지 않았습니다.")
 
     result: dict[str, Any] | None = None
     try:
         result = _analyze_uncached(date, refresh_odds=True) if refresh_odds else _analyze_uncached(date)
-        return result
+        return _current_analysis(result)
     finally:
         with _cache_lock:
             if result is not None:

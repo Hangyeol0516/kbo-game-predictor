@@ -117,14 +117,16 @@ class PredictionStore:
         return connection
 
     def save_analysis(self, analysis: dict[str, Any]) -> None:
+        now = datetime.now(KST)
         if (
             not analysis.get("games")
-            or analysis.get("date") != datetime.now(KST).date().isoformat()
+            or analysis.get("date") != now.date().isoformat()
         ):
             return
         eligible_games = [
             game for game in analysis["games"]
             if game.get("snapshotEligible", analysis.get("snapshotEligible", False))
+            and self._before_start(game, analysis["updatedAt"], now)
         ]
         if not eligible_games:
             return
@@ -140,7 +142,8 @@ class PredictionStore:
                    (prediction_date, model_version, lineup_status, created_at, payload_json)
                    VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(prediction_date, model_version, lineup_status) DO UPDATE SET
-                     created_at=excluded.created_at, payload_json=excluded.payload_json""",
+                     created_at=excluded.created_at, payload_json=excluded.payload_json
+                   WHERE excluded.created_at > analysis_snapshots.created_at""",
                 (analysis["date"], model_version, snapshot_lineup_status, created_at, json.dumps(analysis, ensure_ascii=False)),
             )
             for game in eligible_games:
@@ -156,7 +159,8 @@ class PredictionStore:
                          created_at=excluded.created_at,
                          away_probability=excluded.away_probability,
                          home_probability=excluded.home_probability,
-                         predicted_winner=excluded.predicted_winner""",
+                         predicted_winner=excluded.predicted_winner
+                       WHERE excluded.created_at > game_predictions.created_at""",
                     (
                         analysis["date"], game["id"], model_version, lineup_status, created_at,
                         game["away"], game["home"],
@@ -201,7 +205,8 @@ class PredictionStore:
                              betting_open=excluded.betting_open,
                              market_updated_at=excluded.market_updated_at,
                              commence_at=excluded.commence_at,
-                             recommended=excluded.recommended""",
+                             recommended=excluded.recommended
+                           WHERE excluded.created_at > value_bet_predictions.created_at""",
                         (
                             analysis["date"], game["id"], model_version, lineup_status, created_at,
                             value["favorite"]["team"], underdog["team"], underdog["odds"],
@@ -215,6 +220,21 @@ class PredictionStore:
                             value.get("lastUpdate"), value.get("commenceTime"), int(value["recommendation"]),
                         ),
                     )
+
+    @staticmethod
+    def _before_start(game: dict[str, Any], created_at: str, now: datetime) -> bool:
+        # 구버전 스냅샷은 startsAt 없이 저장되므로 기존 데이터 계약을 유지한다.
+        if "startsAt" not in game:
+            return True
+        try:
+            starts_at = datetime.fromisoformat(game["startsAt"])
+            generated_at = datetime.fromisoformat(created_at)
+            return (
+                starts_at.tzinfo is not None and generated_at.tzinfo is not None
+                and generated_at < starts_at and now < starts_at
+            )
+        except (TypeError, ValueError):
+            return False
 
     def pending_dates(self) -> list[str]:
         today = datetime.now(KST).date()

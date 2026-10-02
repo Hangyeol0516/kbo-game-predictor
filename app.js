@@ -6,6 +6,7 @@ const teams = {
   NC: { name: "NC 다이노스", color: "#315288" }, 키움: { name: "키움 히어로즈", color: "#6f263d" },
 };
 const state = { date: new Date(), position: "전체", data: null, loading: false, requestId: 0 };
+let valueExpiryTimer;
 const pad = (number) => String(number).padStart(2, "0");
 const toInputDate = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 const formatUpdated = (value) => new Intl.DateTimeFormat("ko-KR", { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
@@ -139,7 +140,34 @@ function renderHitters() {
     <div class="hitter-runners">${rest.map((player, index) => `<article class="runner-card"><strong>0${index + 2}</strong><div><h3>${escapeHtml(player.name)} <small>· ${escapeHtml(player.rawPosition)}</small></h3><p>${escapeHtml(teams[player.team]?.name || player.team)} · ${escapeHtml(player.opponent)} · 시즌 ${player.avg.toFixed(3)} · ${escapeHtml(player.pitcherHand)} 상대 ${player.matchupAvg.toFixed(3)} · ${escapeHtml(player.order)}</p></div><span class="runner-prob">${player.probability}%</span></article>`).join("")}</div>`;
 }
 
+function updateValueBetTime() {
+  const now = Date.now();
+  const deadlines = [];
+  for (const game of state.data?.games || []) {
+    const value = game.valueBet;
+    if (!value?.available) continue;
+    const priceTimes = [value.favorite.lastUpdate, value.underdog.lastUpdate].map(Date.parse);
+    const freshUntil = Math.min(...priceTimes) + value.criterion.maximumAgeMinutes * 60000;
+    const openUntil = Date.parse(value.commenceTime) - value.criterion.closeBeforeMinutes * 60000;
+    value.quality.marketFresh = Number.isFinite(freshUntil) && now <= freshUntil;
+    value.quality.bettingOpen = Number.isFinite(openUntil) && now < openUntil;
+    value.quality.ageMinutes = priceTimes.every(Number.isFinite)
+      ? Math.round(Math.max(0, ...priceTimes.map(updated => (now - updated) / 60000)) * 10) / 10 : null;
+    value.recommendation = value.recommendation && value.quality.marketFresh && value.quality.bettingOpen;
+    if (value.quality.marketFresh) deadlines.push(freshUntil + 1);
+    if (value.quality.bettingOpen) deadlines.push(openUntil);
+  }
+  return deadlines.length ? Math.min(...deadlines) : null;
+}
+
 function renderAnalysis() {
+  const nextExpiry = updateValueBetTime();
+  clearTimeout(valueExpiryTimer);
+  if (nextExpiry !== null) {
+    valueExpiryTimer = setTimeout(() => {
+      if (state.data) renderAnalysis();
+    }, Math.min(Math.max(nextExpiry - Date.now(), 1), 2147483647));
+  }
   renderGames(); renderValueBets(); renderFilters(); renderHitters();
   const status = state.data.lineupStatus === "confirmed" ? "확정 라인업 반영" : "최근 라인업 기준";
   document.querySelector("#lineupLegend").innerHTML = `<i></i> ${status}`;
@@ -174,6 +202,7 @@ async function loadPerformance() {
 
 async function loadAnalysis() {
   const requestId = ++state.requestId;
+  clearTimeout(valueExpiryTimer);
   state.loading = true; state.data = null; renderDate(); renderLoading(); renderFilters();
   try {
     const response = await fetch(`/api/analysis?date=${toInputDate(state.date)}`);
@@ -183,7 +212,7 @@ async function loadAnalysis() {
     state.data = payload; renderAnalysis(); loadPerformance();
   } catch (error) {
     if (requestId === state.requestId) renderError(error.message);
-  } finally { state.loading = false; }
+  } finally { if (requestId === state.requestId) state.loading = false; }
 }
 
 function changeDate(offset) {

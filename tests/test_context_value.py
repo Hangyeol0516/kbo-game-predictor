@@ -1,4 +1,5 @@
 import unittest
+import hashlib
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -86,7 +87,7 @@ class ContextValueTest(unittest.TestCase):
     @patch("kbo_analysis._get_json_response", side_effect=RuntimeError("provider unavailable"))
     def test_provider_error_never_returns_stale_odds(self, _get_json_response):
         kbo_analysis._odds_cache.update({
-            "created": 1.0, "regions": "eu", "credential": "old", "eventsByDate": {
+            "created": 1.0, "regions": "eu", "credential": hashlib.sha256(b"secret").hexdigest()[:12], "eventsByDate": {
                 "2026-09-28": {("LG", "두산"): {"stale": True}},
             },
         })
@@ -95,6 +96,7 @@ class ContextValueTest(unittest.TestCase):
         }):
             self.assertEqual(fetch_market_odds("2026-09-28", refresh=True), {})
             self.assertEqual(odds_provider_status()["lastError"], "RuntimeError")
+            self.assertEqual(fetch_market_odds("2026-09-28"), {})
 
     @patch("kbo_analysis._get_json_response")
     def test_market_odds_uses_best_price_and_devigged_consensus(self, get_json_response):

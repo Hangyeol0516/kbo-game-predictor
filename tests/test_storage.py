@@ -2,6 +2,7 @@ import sqlite3
 import tempfile
 import unittest
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -108,11 +109,53 @@ class PredictionStoreTest(unittest.TestCase):
             mocked_datetime.now.return_value.date.return_value.isoformat.return_value = "2026-04-01"
             self.store.save_analysis(analysis)
             self.store.save_analysis(later)
+            # 이전 응답이 새 응답보다 늦게 저장되어도 최신 기록을 유지한다.
+            self.store.save_analysis(analysis)
         with self.store.connect() as connection:
             row = connection.execute(
                 "SELECT created_at, underdog_odds, recommended FROM value_bet_predictions",
             ).fetchone()
         self.assertEqual(tuple(row), ("2026-04-01T18:00:00+09:00", 2.6, 1))
+        with self.store.connect() as connection:
+            prediction = connection.execute("SELECT created_at FROM game_predictions").fetchone()
+            snapshot = connection.execute("SELECT created_at FROM analysis_snapshots").fetchone()
+        self.assertEqual(prediction[0], later["updatedAt"])
+        self.assertEqual(snapshot[0], later["updatedAt"])
+
+    def test_cached_snapshot_cannot_be_saved_at_or_after_first_pitch(self):
+        now = datetime(2026, 4, 1, 18, tzinfo=timezone(timedelta(hours=9)))
+        analysis = {
+            "date": "2026-04-01", "updatedAt": "2026-04-01T17:59:00+09:00",
+            "methodVersion": "model-a", "lineupStatus": "projected", "snapshotEligible": True,
+            "games": [{"id": "game-1", "away": "LG", "home": "두산",
+                       "awayProb": 40, "homeProb": 60, "pick": "두산", "snapshotEligible": True,
+                       "startsAt": now.isoformat()}],
+        }
+        with patch("storage.datetime", wraps=datetime) as clock:
+            clock.now.return_value = now
+            self.store.save_analysis(analysis)
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM game_predictions").fetchone()[0], 0)
+
+    def test_only_games_that_have_not_started_are_saved(self):
+        now = datetime(2026, 4, 1, 18, tzinfo=timezone(timedelta(hours=9)))
+        base = {"away": "LG", "home": "두산", "awayProb": 40, "homeProb": 60,
+                "pick": "두산", "snapshotEligible": True}
+        analysis = {
+            "date": "2026-04-01", "updatedAt": "2026-04-01T17:59:00+09:00",
+            "methodVersion": "model-a", "lineupStatus": "projected", "snapshotEligible": True,
+            "games": [
+                {**base, "id": "started", "startsAt": now.isoformat()},
+                {**base, "id": "later", "startsAt": (now + timedelta(minutes=30)).isoformat()},
+                {**base, "id": "unknown", "startsAt": None},
+            ],
+        }
+        with patch("storage.datetime", wraps=datetime) as clock:
+            clock.now.return_value = now
+            self.store.save_analysis(analysis)
+        with self.store.connect() as connection:
+            rows = connection.execute("SELECT game_id FROM game_predictions").fetchall()
+        self.assertEqual([row[0] for row in rows], ["later"])
 
     def test_model_filter_is_applied_before_snapshot_ranking(self):
         with self.store.connect() as connection:
