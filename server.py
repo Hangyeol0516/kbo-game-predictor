@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from kbo_analysis import active_model_version, analyze, fetch_games, odds_provider_status
+from kbo_analysis import DataContractError, active_model_version, analyze, fetch_games, odds_provider_status
 from storage import PredictionStore
 
 
@@ -75,21 +75,44 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not date:
                 return self.send_json({"error": "date가 필요합니다."}, 400)
             try:
-                datetime.strptime(date, "%Y-%m-%d")
+                selected_date = datetime.strptime(date, "%Y-%m-%d").date()
+                date = selected_date.isoformat()
             except ValueError:
                 return self.send_json({"error": "날짜 형식은 YYYY-MM-DD여야 합니다."}, 400)
             force = params.get("refresh", ["0"])[0] == "1"
+            mode = params.get("mode", ["auto"])[0]
+            if mode not in ("auto", "historical", "reanalysis"):
+                return self.send_json({"error": "지원하지 않는 조회 방식입니다."}, 400)
             if force:
                 expected_token = os.environ.get("PLAYBALL_REFRESH_TOKEN", "")
                 supplied_token = self.headers.get("X-Refresh-Token", "")
                 if not expected_token or not hmac.compare_digest(supplied_token, expected_token):
                     return self.send_json({"error": "강제 갱신 권한이 없습니다."}, 403)
+            is_past = selected_date < datetime.now(KST).date()
+            if mode == "historical" or (is_past and mode == "auto"):
+                try:
+                    return self.send_json(STORE.historical_analysis(date))
+                except Exception as exc:
+                    self.log_error("history read failed: %s", exc)
+                    return self.send_json({"error": "저장된 예측을 읽지 못했습니다."}, 500)
             if not ANALYSIS_SLOTS.acquire(blocking=False):
                 return self.send_json({"error": "분석 요청이 많습니다. 잠시 후 다시 시도해 주세요."}, 429)
             try:
-                analysis = analyze(date, force=force, refresh_odds=force)
-                STORE.save_analysis(analysis)
+                analysis = analyze(date, force=force, refresh_odds=force and not is_past)
+                analysis["viewMode"] = "reanalysis" if is_past else "live"
+                if is_past:
+                    analysis["snapshotEligible"] = False
+                    analysis["valueBetStatus"] = "reanalysis"
+                    analysis["valueBets"] = []
+                    for game in analysis["games"]:
+                        game["snapshotEligible"] = False
+                        game["valueBet"] = {"available": False, "recommendation": False, "reason": "현재 기록을 사용한 재분석"}
+                else:
+                    STORE.save_analysis(analysis)
                 return self.send_json(analysis)
+            except DataContractError as exc:
+                self.log_error("upstream data invalid: %s", exc)
+                return self.send_json({"error": str(exc), "dataQuality": {"status": "invalid"}}, 502)
             except Exception as exc:
                 self.log_error("analysis failed: %s", exc)
                 return self.send_json({"error": "KBO 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."}, 502)

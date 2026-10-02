@@ -101,6 +101,7 @@ class ContextValueTest(unittest.TestCase):
     @patch("kbo_analysis._get_json_response")
     def test_market_odds_uses_best_price_and_devigged_consensus(self, get_json_response):
         get_json_response.return_value = ([{
+            "id": "event-1",
             "away_team": "LG Twins", "home_team": "Doosan Bears",
             "commence_time": "2026-09-28T09:30:00Z",
             "bookmakers": [
@@ -120,7 +121,7 @@ class ContextValueTest(unittest.TestCase):
             "PLAYBALL_ODDS_API_KEY": "secret", "PLAYBALL_ODDS_REGIONS": "eu",
         }):
             self.assertEqual(fetch_market_odds("2026-09-28"), {})
-            market = fetch_market_odds("2026-09-28", refresh=True)[("LG", "두산")]
+            market = fetch_market_odds("2026-09-28", refresh=True)["event-1"]
             self.assertEqual(fetch_market_odds("2026-09-29"), {})
             refreshed = fetch_market_odds("2026-09-28", refresh=True)
             status = odds_provider_status()
@@ -132,7 +133,7 @@ class ContextValueTest(unittest.TestCase):
             + market["teams"]["두산"]["marketProbability"],
             1.0,
         )
-        self.assertEqual(refreshed[("LG", "두산")]["teams"]["LG"]["price"], 1.75)
+        self.assertEqual(refreshed["event-1"]["teams"]["LG"]["price"], 1.75)
         self.assertEqual(get_json_response.call_count, 2)
         self.assertEqual(status["creditsRemaining"], 499.0)
         self.assertEqual(status["eventCount"], 1)

@@ -53,7 +53,7 @@ class StaticServerSecurityTest(unittest.TestCase):
     def test_force_refresh_accepts_the_configured_header(self):
         payload = {"date": "2026-09-29", "games": [], "snapshotEligible": False}
         request = Request(
-            f"{self.base_url}/api/analysis?date=2026-09-29&refresh=1",
+            f"{self.base_url}/api/analysis?date=2026-09-29&refresh=1&mode=reanalysis",
             headers={"X-Refresh-Token": "test-token"},
         )
         with (
@@ -63,7 +63,7 @@ class StaticServerSecurityTest(unittest.TestCase):
         ):
             with urlopen(request, timeout=2) as response:
                 self.assertEqual(json.load(response)["date"], "2026-09-29")
-        analyze.assert_called_once_with("2026-09-29", force=True, refresh_odds=True)
+        analyze.assert_called_once_with("2026-09-29", force=True, refresh_odds=False)
 
     def test_performance_read_does_not_synchronously_fetch_results(self):
         payload = {"evaluatedGames": 0, "recent": [], "valueBet": {}}
@@ -80,6 +80,33 @@ class StaticServerSecurityTest(unittest.TestCase):
             with self.assertRaises(HTTPError) as error:
                 urlopen(f"{self.base_url}/health", timeout=2)
         self.assertEqual(error.exception.code, 503)
+
+    def test_past_date_reads_saved_predictions_without_upstream_requests(self):
+        payload = {"date": "2026-04-01", "viewMode": "historical", "games": [], "historyStatus": "missing"}
+        with patch.object(server.STORE, "historical_analysis", return_value=payload) as history, patch("server.analyze") as analyze:
+            with urlopen(f"{self.base_url}/api/analysis?date=2026-04-01", timeout=2) as response:
+                self.assertEqual(json.load(response)["viewMode"], "historical")
+        history.assert_called_once_with("2026-04-01")
+        analyze.assert_not_called()
+
+    def test_explicit_past_reanalysis_is_marked_and_never_saved_or_recommends_bets(self):
+        payload = {"date": "2026-04-01", "snapshotEligible": True,
+                   "games": [{"snapshotEligible": True, "valueBet": {"available": True, "recommendation": True}}]}
+        with patch("server.analyze", return_value=payload) as analyze, patch.object(server.STORE, "save_analysis") as save:
+            with urlopen(f"{self.base_url}/api/analysis?date=2026-04-01&mode=reanalysis", timeout=2) as response:
+                result = json.load(response)
+        self.assertEqual(result["viewMode"], "reanalysis")
+        self.assertFalse(result["snapshotEligible"])
+        self.assertFalse(result["games"][0]["valueBet"]["recommendation"])
+        analyze.assert_called_once_with("2026-04-01", force=False, refresh_odds=False)
+        save.assert_not_called()
+
+    def test_invalid_upstream_records_report_a_data_quality_error(self):
+        with patch("server.analyze", side_effect=server.DataContractError("팀 기록: 컬럼 누락")):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(f"{self.base_url}/api/analysis?date=2026-04-01&mode=reanalysis", timeout=2)
+        self.assertEqual(error.exception.code, 502)
+        self.assertEqual(json.load(error.exception)["dataQuality"]["status"], "invalid")
 
 
 class CollectorScheduleTest(unittest.TestCase):

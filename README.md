@@ -124,6 +124,8 @@ docker run -d \
 ## 제공 기능
 
 - 날짜별 KBO 공식 일정과 예고 선발 조회
+- 더블헤더 경기 ID별 선발 유형·타자 매치업과 배당 이벤트 연결
+- 과거 날짜의 저장된 당시 예측 조회와 명시적인 현재 기록 재분석
 - 팀 득점력·ERA·출루율을 이용한 경기 승률
 - 선발 ERA·WHIP과 최근 3일 불펜 투구량 반영
 - 1군 엔트리 이탈, 구장 득점 계수와 경기 시간 날씨 반영
@@ -144,7 +146,7 @@ The Odds API ──┘             │
                              └─> SQLite 스냅샷 ─> 채점·백테스트
 ```
 
-현재 모델 버전은 `stats-v5-context-value`입니다. 상세 계산식과 데이터 누수 방침은 [모델 카드](docs/model-card.md)에 정리되어 있습니다.
+현재 모델 버전은 `stats-v6-game-context`입니다. 경기별 연결과 기록 검증이 바뀌었으므로 이전 버전의 보정기와 성능을 v6에 합치지 않습니다. 과거 예측은 계속 조회할 수 있고 이전 성능은 `modelVersion=all`로 확인할 수 있습니다. 상세 계산식과 데이터 누수 방침은 [모델 카드](docs/model-card.md)에 정리되어 있습니다.
 
 ## HTTP 엔드포인트
 
@@ -152,12 +154,18 @@ The Odds API ──┘             │
 | --- | --- |
 | `/` | 웹 화면 |
 | `/health` | DB, 수집기, 배당 제공사와 캐시 상태 |
-| `/api/analysis?date=YYYY-MM-DD` | 해당 날짜의 경기·타자·역배 분석 |
+| `/api/analysis?date=YYYY-MM-DD` | 오늘·미래는 분석, 과거는 저장된 당시 예측 조회 |
+| `/api/analysis?date=YYYY-MM-DD&mode=historical` | 해당 날짜의 저장된 경기 전 예측 조회 |
+| `/api/analysis?date=YYYY-MM-DD&mode=reanalysis` | 과거 경기를 현재 시즌 기록으로 재분석. 당시 예측·배당 추천·평가 저장과 구분 |
 | `/api/analysis?date=YYYY-MM-DD&refresh=1` | `X-Refresh-Token`이 일치할 때만 분석 캐시 우회 |
 | `/api/performance` | 현재 활성 모델의 적중률·Brier Score·역배 ROI |
 | `/api/performance?modelVersion=all` | 모든 모델 버전을 합친 참고용 성능 |
 
 화면에 필요한 정적 파일 이외의 경로는 `404`를 반환합니다.
+
+과거 조회에서 기록이 없으면 `historyStatus=missing`으로 표시하며 외부 데이터를 요청해 당시 예측을 복원하지 않습니다. 경기별 상세 JSON 저장을 위해 SQLite에 열을 추가하는 비파괴 마이그레이션을 수행합니다. 이전 저장 형식은 `historyStatus=partial`이며 당시 승률만 제공합니다. 새 예측은 경기별 근거·타자 후보·자료 상태까지 보존합니다.
+
+KBO 기록은 컬럼 이름으로 읽고 구조 변경, 팀 필터 실패, 누락·잘못된 숫자와 타수/안타 모순을 검증합니다. 필수 자료가 잘못되면 `502`와 `dataQuality.status=invalid`를 반환합니다. 표본 부족이나 엔트리·날씨 미제공 등은 `dataQuality.warnings`와 화면 안내로 보완 자료를 표시합니다. 미확인 선발 유형은 우투로 가정하지 않습니다.
 
 ## 로컬 개발
 
@@ -201,7 +209,7 @@ docker compose exec playball python scripts/evaluate_value_thresholds.py \
 
 백테스트는 기본적으로 현재 기본 모델 버전만 평가합니다. 모든 과거 버전을 합치려면 `scripts/backtest.py`에 `--all-models`를 지정합니다. 임계값 탐색 결과는 같은 표본에서 과적합될 수 있으므로 반드시 이후 기간에서 다시 검증해야 합니다.
 
-종료 경기 100개 이상이 쌓이면 날짜 앞 80%를 학습, 뒤 20%를 검증에 사용해 Platt 보정기를 만들 수 있습니다. 검증 Brier Score가 개선되지 않으면 보정 파일을 생성하지 않습니다.
+현재 모델의 종료 경기 100개 이상이 쌓이면 날짜 앞 60%를 학습, 다음 20%를 검증, 마지막 20%를 별도 테스트에 사용해 Platt 보정기를 만들 수 있습니다. 같은 날짜는 구간을 나누지 않으며 검증과 테스트에 각각 최소 20경기가 필요합니다. 검증 Brier Score가 개선되지 않으면 보정 파일을 생성하지 않습니다. 테스트 구간은 학습·활성화 판단에 사용하지 않고 결과와 각 구간 날짜를 파일에 기록합니다.
 
 ```bash
 docker compose exec playball python scripts/train_calibrator.py \

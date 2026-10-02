@@ -198,7 +198,7 @@ class PredictionStoreTest(unittest.TestCase):
             columns = {row[1] for row in connection.execute("PRAGMA table_info(value_bet_predictions)")}
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertTrue({"bookmaker_count", "market_age_minutes", "betting_open"}.issubset(columns))
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 3)
 
 
 if __name__ == "__main__":

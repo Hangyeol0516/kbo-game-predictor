@@ -20,6 +20,7 @@ CREATE TABLE game_predictions (
     away_probability NUMERIC(6,5) NOT NULL CHECK (away_probability BETWEEN 0 AND 1),
     home_probability NUMERIC(6,5) NOT NULL CHECK (home_probability BETWEEN 0 AND 1),
     predicted_winner TEXT NOT NULL,
+    payload JSONB,
     UNIQUE (prediction_date, game_id, model_version, lineup_status)
 );
 

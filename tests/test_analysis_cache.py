@@ -140,6 +140,79 @@ class AnalysisCacheTest(unittest.TestCase):
         self.assertEqual(analyze_uncached.call_count, 3)
         self.assertEqual(list(kbo_analysis._cache), ["20260928"])
 
+    def test_force_and_odds_refresh_are_not_lost_behind_an_inflight_request(self):
+        for refresh in (False, True):
+            with self.subTest(refresh=refresh):
+                kbo_analysis._cache.clear()
+                entered, release, joined = threading.Event(), threading.Event(), threading.Event()
+                results, calls = [], []
+
+                def compute(date, refresh_odds=False):
+                    calls.append(refresh_odds)
+                    if len(calls) == 1:
+                        entered.set()
+                        if not release.wait(2):
+                            raise TimeoutError("test synchronization")
+                    return {"date": date, "games": [], "revision": len(calls)}
+
+                with patch("kbo_analysis._analyze_uncached", side_effect=compute):
+                    owner = threading.Thread(target=lambda: results.append(analyze("2026-10-02")))
+                    owner.start()
+                    self.assertTrue(entered.wait(2))
+                    flight = kbo_analysis._inflight["20261002"]
+                    original_wait = flight.event.wait
+
+                    def wait(timeout):
+                        joined.set()
+                        return original_wait(timeout)
+
+                    with patch.object(flight.event, "wait", side_effect=wait):
+                        waiter = threading.Thread(target=lambda: results.append(analyze("2026-10-02", force=True, refresh_odds=refresh)))
+                        waiter.start()
+                        self.assertTrue(joined.wait(2))
+                        release.set()
+                        owner.join(2)
+                        waiter.join(2)
+                self.assertEqual(calls, [False, refresh])
+                self.assertEqual([result["revision"] for result in results], [2, 2])
+
+    def test_failed_refresh_is_reported_to_waiters_instead_of_returning_old_cache(self):
+        with patch("kbo_analysis._analyze_uncached", return_value={"date": "2026-10-02", "games": [], "revision": 0}):
+            analyze("2026-10-02")
+        entered, release, joined = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+
+        def compute(date):
+            entered.set()
+            release.wait(2)
+            raise ValueError("refresh failed")
+
+        def call(force):
+            try:
+                analyze("2026-10-02", force=force)
+            except ValueError as exc:
+                errors.append(str(exc))
+
+        with patch("kbo_analysis._analyze_uncached", side_effect=compute):
+            owner = threading.Thread(target=call, args=(True,))
+            owner.start()
+            self.assertTrue(entered.wait(2))
+            flight = kbo_analysis._inflight["20261002"]
+            original_wait = flight.event.wait
+
+            def wait(timeout):
+                joined.set()
+                return original_wait(timeout)
+
+            with patch.object(flight.event, "wait", side_effect=wait):
+                waiter = threading.Thread(target=call, args=(False,))
+                waiter.start()
+                self.assertTrue(joined.wait(2))
+                release.set()
+                owner.join(2)
+                waiter.join(2)
+        self.assertEqual(errors, ["refresh failed", "refresh failed"])
+
 
 if __name__ == "__main__":
     unittest.main()

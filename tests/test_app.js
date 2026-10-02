@@ -7,27 +7,30 @@ const vm = require("node:vm");
 function browser(now) {
   const elements = new Map();
   const timers = new Map();
+  const requests = [];
   let timerId = 0;
   class Clock extends Date {
     static now() { return now.value; }
   }
   const context = vm.createContext({
     Date: Clock, Intl,
-    fetch: () => new Promise(() => {}),
+    fetch: url => { requests.push(url); return new Promise(() => {}); },
     clearTimeout: id => timers.delete(id),
     setTimeout: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; },
     document: {
       querySelector(selector) {
         if (!elements.has(selector)) elements.set(selector, {
           innerHTML: "", textContent: "", value: "",
-          addEventListener() {}, querySelectorAll: () => [],
+          handlers: {},
+          addEventListener(name, callback) { this.handlers[name] = callback; },
+          setAttribute() {}, querySelectorAll: () => [],
         });
         return elements.get(selector);
       },
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, "../app.js"), "utf8"), context);
-  return { context, elements, timers };
+  return { context, elements, timers, requests };
 }
 
 function payload(now, { startMinutes = 11, priceAge = 0 } = {}) {
@@ -87,4 +90,42 @@ test("changing dates cancels the previous page's expiration timer", () => {
   assert.equal(timers.size, 1);
   vm.runInContext("changeDate(1)", context);
   assert.equal(timers.size, 0);
+});
+
+test("historical recommendations are preserved and clearly labeled as past decisions", () => {
+  const initial = Date.parse("2026-10-02T09:00:00Z");
+  const now = { value: initial + 86400000 };
+  const { context, elements, timers } = browser(now);
+  context.payload = { ...payload(initial), viewMode: "historical" };
+  vm.runInContext("state.data = payload; renderAnalysis()", context);
+  assert.match(elements.get("#valueContent").innerHTML, /당시 역배 PICK/);
+  assert.match(elements.get("#dataNotice").innerHTML, /저장된 당시 예측/);
+  assert.doesNotMatch(elements.get("#dataNotice").innerHTML, /LIVE DATA/);
+  assert.equal(timers.size, 0);
+});
+
+test("missing historical records are not presented as a date without games", () => {
+  const { context, elements } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
+  context.payload = { viewMode: "historical", games: [], hitters: {}, updatedAt: null,
+    methodVersion: "—", source: "저장된 예측", message: "예측이 저장되지 않았습니다." };
+  vm.runInContext("state.data = payload; renderAnalysis()", context);
+  assert.match(elements.get("#gameGrid").innerHTML, /저장된 당시 예측이 없습니다/);
+  assert.doesNotMatch(elements.get("#gameGrid").innerHTML, /KBO 경기가 없습니다/);
+});
+
+test("reanalysis selection is explicit and date navigation resets to the default view", () => {
+  const { context, elements, requests } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
+  vm.runInContext('state.date = new Date("2026-09-29T12:00:00")', context);
+  elements.get("#reanalysisButton").handlers.click();
+  assert.match(requests.at(-1), /date=2026-09-29&mode=reanalysis/);
+  vm.runInContext("changeDate(1)", context);
+  assert.match(requests.at(-1), /date=2026-09-30&mode=auto/);
+});
+
+test("incomplete data warnings are visible and escaped", () => {
+  const now = { value: Date.parse("2026-10-02T09:00:00Z") };
+  const { context, elements } = browser(now);
+  context.payload = { ...payload(now.value), dataQuality: { warnings: ["선발 유형 미확인 <test>"] } };
+  vm.runInContext("state.data = payload; renderAnalysis()", context);
+  assert.match(elements.get("#dataNotice").innerHTML, /선발 유형 미확인 &lt;test&gt;/);
 });

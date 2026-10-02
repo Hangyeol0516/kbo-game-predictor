@@ -5,7 +5,7 @@ const teams = {
   SSG: { name: "SSG 랜더스", color: "#ce0e2d" }, KT: { name: "KT 위즈", color: "#222222" },
   NC: { name: "NC 다이노스", color: "#315288" }, 키움: { name: "키움 히어로즈", color: "#6f263d" },
 };
-const state = { date: new Date(), position: "전체", data: null, loading: false, requestId: 0 };
+const state = { date: new Date(), mode: "auto", position: "전체", data: null, loading: false, requestId: 0 };
 let valueExpiryTimer;
 const pad = (number) => String(number).padStart(2, "0");
 const toInputDate = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
@@ -19,6 +19,10 @@ function renderDate() {
   document.querySelector("#dateText").textContent = `${state.date.getFullYear()}. ${pad(state.date.getMonth() + 1)}. ${pad(state.date.getDate())} ${weekdays[state.date.getDay()]}`;
   document.querySelector("#dateSubText").textContent = "KBO 공식 일정 기준";
   document.querySelector("#nativeDate").value = toInputDate(state.date);
+  const past = toInputDate(state.date) < new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+  document.querySelector("#historyControls").hidden = !past;
+  document.querySelector("#historyButton").setAttribute("aria-pressed", state.mode !== "reanalysis");
+  document.querySelector("#reanalysisButton").setAttribute("aria-pressed", state.mode === "reanalysis");
 }
 
 function teamBlock(code, pitcher) {
@@ -47,16 +51,20 @@ function renderGames() {
   const grid = document.querySelector("#gameGrid");
   const games = state.data?.games || [];
   if (!games.length) {
+    if (state.data?.viewMode === "historical") {
+      grid.innerHTML = `<div class="empty-state"><strong>저장된 당시 예측이 없습니다.</strong>${escapeHtml(state.data.message)}</div>`;
+      return;
+    }
     grid.innerHTML = `<div class="empty-state"><strong>이 날짜에는 KBO 경기가 없습니다.</strong>KBO 공식 일정에서 등록된 경기를 찾지 못했습니다.</div>`;
     return;
   }
   grid.innerHTML = games.map((game, index) => `
     <article class="game-card ${game.valueBet?.recommendation ? "value-pick" : ""}">
-      <div class="game-meta"><span>${escapeHtml(game.time)} · ${escapeHtml(game.park)} 야구장 · ${escapeHtml(game.weather?.summary || "날씨 미제공")}</span><strong>${game.valueBet?.recommendation ? "역배 EV+" : `GAME ${pad(index + 1)}`}</strong></div>
+      <div class="game-meta"><span>${escapeHtml(game.time)} · ${escapeHtml(game.park)} 야구장 · ${escapeHtml(game.weather?.summary || "날씨 미제공")}</span><strong>${game.valueBet?.recommendation ? (state.data.viewMode === "historical" ? "당시 역배 추천" : "역배 EV+") : `GAME ${pad(index + 1)}`}</strong></div>
       <div class="matchup">${teamBlock(game.away, game.awayPitcher)}<div class="prediction"><small>STATS PICK</small><strong>${escapeHtml(game.pick)}</strong><span>${escapeHtml(game.confidence)}</span></div>${teamBlock(game.home, game.homePitcher)}</div>
       <div class="probability-row"><b>${game.awayProb}%</b><div class="probability-track"><i style="width:${game.awayProb}%"></i><i style="width:${game.homeProb}%"></i></div><b>${game.homeProb}%</b></div>
       <button class="reason-toggle" type="button" aria-expanded="false">실제 지표와 계산 근거 보기 <span>⌄</span></button>
-      <ul class="reasons">${game.reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}<li>예고 선발: ${escapeHtml(game.away)} ${escapeHtml(game.awayPitcher)} · ${escapeHtml(game.home)} ${escapeHtml(game.homePitcher)}</li></ul>
+      <ul class="reasons">${game.reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}<li>예고 선발: ${escapeHtml(game.away)} ${escapeHtml(game.awayPitcher)} · ${escapeHtml(game.home)} ${escapeHtml(game.homePitcher)}</li>${game.predictionAt ? `<li>당시 예측 시각: ${escapeHtml(game.predictionAt)} · ${escapeHtml(game.modelVersion)}</li>` : ""}</ul>
     </article>`).join("");
   grid.querySelectorAll(".reason-toggle").forEach((button) => button.addEventListener("click", () => {
     const card = button.closest(".game-card"); card.classList.toggle("open");
@@ -71,6 +79,11 @@ function signed(value, suffix = "%") {
 function renderValueBets() {
   const container = document.querySelector("#valueContent");
   const games = state.data?.games || [];
+  const historical = state.data?.viewMode === "historical";
+  if (state.data?.viewMode === "reanalysis") {
+    container.innerHTML = `<div class="empty-state"><strong>현재 기록을 사용한 재분석입니다.</strong>당시 승률이나 배당 추천을 재현한 결과가 아니며, 성능 평가에 저장하지 않습니다.</div>`;
+    return;
+  }
   const available = games.filter(game => game.valueBet?.available);
   const picks = available.filter(game => game.valueBet.recommendation);
   if (state.data?.valueBetStatus === "not-configured") {
@@ -82,12 +95,16 @@ function renderValueBets() {
     return;
   }
   if (!available.length) {
+    if (historical) {
+      container.innerHTML = `<div class="empty-state"><strong>저장된 당시 배당 자료가 없습니다.</strong>현재 배당으로 과거 추천을 복원하지 않습니다.</div>`;
+      return;
+    }
     container.innerHTML = `<div class="empty-state value-empty"><strong>이 날짜의 사전 배당이 없습니다.</strong>배당 시장이 열리지 않았거나 이미 마감된 경기입니다.</div>`;
     return;
   }
   const sorted = [...available].sort((a, b) => b.valueBet.underdog.expectedReturnPct - a.valueBet.underdog.expectedReturnPct);
   const lastUpdate = sorted.map(game => game.valueBet.lastUpdate).filter(Boolean).sort().at(-1);
-  container.innerHTML = `<div class="value-summary"><strong>${picks.length ? `${picks.length}경기 역배 추천` : "추천 없음"}</strong><span>${available.length}경기 배당 비교${lastUpdate ? ` · ${formatUpdated(lastUpdate)} 기준` : ""}</span></div>` + sorted.map(game => {
+  container.innerHTML = `<div class="value-summary"><strong>${historical ? "저장 당시 · " : ""}${picks.length ? `${picks.length}경기 역배 추천` : "추천 없음"}</strong><span>${available.length}경기 배당 비교${lastUpdate ? ` · ${formatUpdated(lastUpdate)} 기준` : ""}</span></div>` + sorted.map(game => {
     const value = game.valueBet;
     const dog = value.underdog;
     const favorite = value.favorite;
@@ -99,9 +116,9 @@ function renderValueBets() {
     if (!value.quality?.enoughBookmakers) misses.push(`북메이커 ${criterion.minimumBookmakers}곳 미만`);
     if (!value.quality?.marketFresh) misses.push(`배당 갱신 ${criterion.maximumAgeMinutes}분 초과`);
     if (!value.quality?.bettingOpen) misses.push(`경기 ${criterion.closeBeforeMinutes}분 전 마감`);
-    const verdict = value.recommendation ? "세 기준을 모두 충족해 정배 대신 선택할 가치가 있습니다." : `보류: ${misses.join(" · ")}`;
+    const verdict = value.recommendation ? (historical ? "저장 당시 추천 기준을 충족했습니다." : "추천 기준을 모두 충족해 정배 대신 선택할 가치가 있습니다.") : `보류: ${misses.join(" · ")}`;
     return `<article class="value-card ${value.recommendation ? "recommended" : "no-bet"}">
-      <div class="value-card-head"><span>${escapeHtml(game.away)} @ ${escapeHtml(game.home)}</span><strong>${value.recommendation ? "역배 PICK" : "NO BET"} · ${escapeHtml(dog.team)}</strong></div>
+      <div class="value-card-head"><span>${escapeHtml(game.away)} @ ${escapeHtml(game.home)} · ${escapeHtml(game.time)}</span><strong>${historical ? "당시 " : ""}${value.recommendation ? "역배 PICK" : "NO BET"} · ${escapeHtml(dog.team)}</strong></div>
       <div class="value-metrics">
         <div><small>최고 배당</small><b>${dog.odds.toFixed(2)}</b><span>${escapeHtml(dog.bookmaker)}</span></div>
         <div><small>모델 / 시장</small><b>${dog.modelProbability}%</b><span>${dog.marketProbability}% · 엣지 ${signed(dog.edgePp, "%p")}</span></div>
@@ -132,15 +149,17 @@ function renderHitters() {
   }
   const [first, ...rest] = players;
   const lineupLabel = first.lineupConfirmed ? "확정 라인업" : "최근 라인업";
+  const estimateLabel = player => player.estimated ? "시즌 기록 없음 · 리그 평균 추정" : player.matchupEstimated ? "유형별 기록 부족 · 시즌 기록 사용" : "시즌·유형별 기록 반영";
   content.innerHTML = `
     <article class="hitter-feature" data-number="1">
-      <div><div class="rank-label">NO. 1 · ${escapeHtml(first.rawPosition)}</div><h3 class="hitter-name">${escapeHtml(first.name)}</h3><div class="hitter-team">${escapeHtml(teams[first.team]?.name || first.team)}</div><div class="matchup-note"><span>${escapeHtml(first.opponent)}</span><span>${escapeHtml(first.pitcher)}</span><span>${escapeHtml(first.order)}</span><span>시즌 AVG ${first.avg.toFixed(3)}</span><span>vs ${escapeHtml(first.pitcherHand)} AVG ${first.matchupAvg.toFixed(3)} (${first.matchupAb}타수)</span><span>${lineupLabel}</span></div></div>
+      <div><div class="rank-label">NO. 1 · ${escapeHtml(first.rawPosition)}</div><h3 class="hitter-name">${escapeHtml(first.name)}</h3><div class="hitter-team">${escapeHtml(teams[first.team]?.name || first.team)}</div><div class="matchup-note"><span>${escapeHtml(first.gameTime || "")} 경기</span><span>${escapeHtml(first.opponent)}</span><span>${escapeHtml(first.pitcher)}</span><span>${escapeHtml(first.order)}</span><span>시즌 AVG ${first.avg.toFixed(3)}</span><span>vs ${escapeHtml(first.pitcherHand)} AVG ${first.matchupAvg.toFixed(3)} (${first.matchupAb}타수)</span><span>${lineupLabel}</span><span>${escapeHtml(estimateLabel(first))}</span></div></div>
       <div class="probability-ring" style="background: conic-gradient(var(--green) ${first.probability * 3.6}deg, #263a31 0deg)"><div><strong>${first.probability}%</strong><span>1+ HIT</span></div></div>
     </article>
-    <div class="hitter-runners">${rest.map((player, index) => `<article class="runner-card"><strong>0${index + 2}</strong><div><h3>${escapeHtml(player.name)} <small>· ${escapeHtml(player.rawPosition)}</small></h3><p>${escapeHtml(teams[player.team]?.name || player.team)} · ${escapeHtml(player.opponent)} · 시즌 ${player.avg.toFixed(3)} · ${escapeHtml(player.pitcherHand)} 상대 ${player.matchupAvg.toFixed(3)} · ${escapeHtml(player.order)}</p></div><span class="runner-prob">${player.probability}%</span></article>`).join("")}</div>`;
+    <div class="hitter-runners">${rest.map((player, index) => `<article class="runner-card"><strong>0${index + 2}</strong><div><h3>${escapeHtml(player.name)} <small>· ${escapeHtml(player.rawPosition)}</small></h3><p>${escapeHtml(teams[player.team]?.name || player.team)} · ${escapeHtml(player.gameTime || "")} 경기 · ${escapeHtml(player.opponent)} · 시즌 ${player.avg.toFixed(3)} · ${escapeHtml(player.pitcherHand)} 상대 ${player.matchupAvg.toFixed(3)} · ${escapeHtml(player.order)} · ${escapeHtml(estimateLabel(player))}</p></div><span class="runner-prob">${player.probability}%</span></article>`).join("")}</div>`;
 }
 
 function updateValueBetTime() {
+  if (state.data?.viewMode === "historical") return null;
   const now = Date.now();
   const deadlines = [];
   for (const game of state.data?.games || []) {
@@ -171,8 +190,11 @@ function renderAnalysis() {
   renderGames(); renderValueBets(); renderFilters(); renderHitters();
   const status = state.data.lineupStatus === "confirmed" ? "확정 라인업 반영" : "최근 라인업 기준";
   document.querySelector("#lineupLegend").innerHTML = `<i></i> ${status}`;
-  document.querySelector("#dataNotice").innerHTML = `<span>LIVE DATA</span> 출처: ${(state.data.sources || [state.data.source]).map(escapeHtml).join(" · ")} · ${formatUpdated(state.data.updatedAt)} 갱신 · ${escapeHtml(state.data.methodVersion)}`;
-  document.querySelector("#liveStatus").innerHTML = `<i></i> ${formatUpdated(state.data.updatedAt)} 갱신`;
+  const modeLabel = state.data.viewMode === "historical" ? "저장된 당시 예측" : state.data.viewMode === "reanalysis" ? "현재 기록으로 재분석 · 당시 예측 아님" : "LIVE DATA";
+  const updated = state.data.updatedAt ? formatUpdated(state.data.updatedAt) : "저장 기록 없음";
+  const warnings = state.data.dataQuality?.warnings || [];
+  document.querySelector("#dataNotice").innerHTML = `<span>${escapeHtml(modeLabel)}</span> 출처: ${(state.data.sources || [state.data.source]).map(escapeHtml).join(" · ")} · ${updated} 기준 · ${escapeHtml(state.data.methodVersion)}${warnings.length ? `<ul>${warnings.map(warning => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}`;
+  document.querySelector("#liveStatus").innerHTML = `<i></i> ${state.data.viewMode === "historical" ? "저장된 예측" : updated + " 갱신"}`;
 }
 
 async function loadPerformance() {
@@ -205,7 +227,7 @@ async function loadAnalysis() {
   clearTimeout(valueExpiryTimer);
   state.loading = true; state.data = null; renderDate(); renderLoading(); renderFilters();
   try {
-    const response = await fetch(`/api/analysis?date=${toInputDate(state.date)}`);
+    const response = await fetch(`/api/analysis?date=${toInputDate(state.date)}&mode=${state.mode}`);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "알 수 없는 오류가 발생했습니다.");
     if (requestId !== state.requestId) return;
@@ -216,18 +238,22 @@ async function loadAnalysis() {
 }
 
 function changeDate(offset) {
+  state.mode = "auto";
   state.date = new Date(state.date.getFullYear(), state.date.getMonth(), state.date.getDate() + offset);
   loadAnalysis();
 }
 document.querySelector("#prevDate").addEventListener("click", () => changeDate(-1));
 document.querySelector("#nextDate").addEventListener("click", () => changeDate(1));
-document.querySelector("#todayButton").addEventListener("click", () => { state.date = new Date(); loadAnalysis(); });
+document.querySelector("#todayButton").addEventListener("click", () => { state.mode = "auto"; state.date = new Date(); loadAnalysis(); });
+document.querySelector("#historyButton").addEventListener("click", () => { state.mode = "historical"; loadAnalysis(); });
+document.querySelector("#reanalysisButton").addEventListener("click", () => { state.mode = "reanalysis"; loadAnalysis(); });
 document.querySelector("#datePicker").addEventListener("click", () => {
   const input = document.querySelector("#nativeDate");
   if (typeof input.showPicker === "function") input.showPicker(); else input.click();
 });
 document.querySelector("#nativeDate").addEventListener("change", (event) => {
   const [year, month, day] = event.target.value.split("-").map(Number);
+  state.mode = "auto";
   state.date = new Date(year, month - 1, day); loadAnalysis();
 });
 loadAnalysis();

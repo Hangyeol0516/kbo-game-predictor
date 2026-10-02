@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS game_predictions (
     away_probability REAL NOT NULL CHECK (away_probability BETWEEN 0 AND 1),
     home_probability REAL NOT NULL CHECK (home_probability BETWEEN 0 AND 1),
     predicted_winner TEXT NOT NULL,
+    payload_json TEXT,
     UNIQUE (prediction_date, game_id, model_version, lineup_status)
 );
 
@@ -107,7 +108,10 @@ class PredictionStore:
         for name, definition in additions.items():
             if name not in columns:
                 connection.execute(f"ALTER TABLE value_bet_predictions ADD COLUMN {name} {definition}")
-        connection.execute("PRAGMA user_version=2")
+        prediction_columns = {row[1] for row in connection.execute("PRAGMA table_info(game_predictions)")}
+        if "payload_json" not in prediction_columns:
+            connection.execute("ALTER TABLE game_predictions ADD COLUMN payload_json TEXT")
+        connection.execute("PRAGMA user_version=3")
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=15)
@@ -120,6 +124,7 @@ class PredictionStore:
         now = datetime.now(KST)
         if (
             not analysis.get("games")
+            or analysis.get("viewMode") in ("historical", "reanalysis")
             or analysis.get("date") != now.date().isoformat()
         ):
             return
@@ -153,19 +158,28 @@ class PredictionStore:
                 connection.execute(
                     """INSERT INTO game_predictions
                        (prediction_date, game_id, model_version, lineup_status, created_at,
-                        away_team, home_team, away_probability, home_probability, predicted_winner)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        away_team, home_team, away_probability, home_probability, predicted_winner, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(prediction_date, game_id, model_version, lineup_status) DO UPDATE SET
                          created_at=excluded.created_at,
                          away_probability=excluded.away_probability,
                          home_probability=excluded.home_probability,
-                         predicted_winner=excluded.predicted_winner
+                         predicted_winner=excluded.predicted_winner, payload_json=excluded.payload_json
                        WHERE excluded.created_at > game_predictions.created_at""",
                     (
                         analysis["date"], game["id"], model_version, lineup_status, created_at,
                         game["away"], game["home"],
                         game.get("awayProbability", game["awayProb"] / 100),
                         game.get("homeProbability", game["homeProb"] / 100), game["pick"],
+                        json.dumps({
+                            "game": game,
+                            "hitters": analysis.get("hittersByGame", {}).get(game["id"], {
+                                position: [player for player in players if player.get("gameId") == game["id"]]
+                                for position, players in analysis.get("hitters", {}).items()
+                            }),
+                            "sources": analysis.get("sources", [analysis.get("source", "KBO 공식 홈페이지")]),
+                            "dataQuality": analysis.get("dataQuality", {}),
+                        }, ensure_ascii=False),
                     ),
                 )
                 value = game.get("valueBet") or {}
@@ -235,6 +249,55 @@ class PredictionStore:
             )
         except (TypeError, ValueError):
             return False
+
+    def historical_analysis(self, prediction_date: str) -> dict[str, Any]:
+        """경기마다 당시 저장한 예측을 조회한다. 현재 시즌 기록으로 복원하지 않는다."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """WITH ranked AS (
+                     SELECT p.*, ROW_NUMBER() OVER (
+                       PARTITION BY game_id
+                       ORDER BY CASE lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END,
+                                created_at DESC, id DESC
+                     ) AS choice
+                     FROM game_predictions p WHERE prediction_date = ?
+                   ) SELECT * FROM ranked WHERE choice = 1 ORDER BY game_id""", (prediction_date,),
+            ).fetchall()
+        games, hitters, sources, warnings = [], {}, set(), []
+        for row in rows:
+            payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+            game = payload.get("game") or {
+                "id": row["game_id"], "away": row["away_team"], "home": row["home_team"],
+                "time": "—", "park": "기록 없음", "awayPitcher": "기록 없음", "homePitcher": "기록 없음",
+                "awayProb": round(row["away_probability"] * 100),
+                "homeProb": round(row["home_probability"] * 100), "pick": row["predicted_winner"],
+                "confidence": "저장된 승률", "reasons": ["이전 저장 형식에는 상세 근거가 없습니다."],
+                "valueBet": {"available": False, "recommendation": False},
+            }
+            game.update({"snapshotEligible": False, "predictionAt": row["created_at"],
+                         "modelVersion": row["model_version"], "lineupConfirmed": row["lineup_status"] == "confirmed"})
+            games.append(game)
+            for position, players in payload.get("hitters", {}).items():
+                hitters.setdefault(position, []).extend(players)
+            sources.update(payload.get("sources", ["KBO 공식 홈페이지"]))
+            warnings.extend(payload.get("dataQuality", {}).get("warnings", []))
+        for position, players in hitters.items():
+            hitters[position] = sorted(players, key=lambda player: player["probability"], reverse=True)[:3]
+        return {
+            "date": prediction_date, "viewMode": "historical",
+            "historyStatus": "partial" if any(not row["payload_json"] for row in rows) else "available" if rows else "missing",
+            "games": games, "hitters": hitters, "snapshotEligible": False,
+            "updatedAt": max((row["created_at"] for row in rows), default=None),
+            "source": "저장된 당시 예측", "sources": sorted(sources) or ["저장된 당시 예측"],
+            "methodVersion": ", ".join(sorted({row["model_version"] for row in rows})) or "—",
+            "lineupStatus": "confirmed" if rows and all(row["lineup_status"] == "confirmed" for row in rows) else "projected",
+            "valueBetStatus": "historical", "valueBets": [
+                game["valueBet"] | {"gameId": game["id"], "away": game["away"], "home": game["home"], "historical": True}
+                for game in games if (game.get("valueBet") or {}).get("recommendation")
+            ],
+            "dataQuality": {"warnings": list(dict.fromkeys(warnings))},
+            "message": None if rows else "이 날짜에 저장된 경기 전 예측이 없습니다. 현재 기록을 사용한 재분석은 별도로 선택할 수 있습니다.",
+        }
 
     def pending_dates(self) -> list[str]:
         today = datetime.now(KST).date()

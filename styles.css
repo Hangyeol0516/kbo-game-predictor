@@ -174,7 +174,9 @@ main { overflow: hidden; }
 .position-filters { max-width: 1200px; margin: 0 auto 22px; display: flex; gap: 7px; overflow-x: auto; padding-bottom: 3px; scrollbar-width: none; }
 .position-filters::-webkit-scrollbar { display: none; }
 .position-button { flex: 0 0 auto; border: 1px solid #cbc8bc; border-radius: 100px; padding: 8px 15px; background: transparent; font-size: 12px; font-weight: 700; cursor: pointer; }
-.position-button:hover, .position-button.active { background: var(--ink); border-color: var(--ink); color: white; }
+.position-button:hover, .position-button.active, #historyControls [aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: white; }
+#historyControls { max-width: 1152px; padding: 0 16px; }
+#historyControls[hidden] { display: none; }
 .hitter-content { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 1.45fr 1fr; gap: 16px; }
 .hitter-feature { min-height: 277px; border-radius: 12px; background: var(--ink); color: white; padding: 28px 30px; position: relative; overflow: hidden; display: grid; grid-template-columns: 1fr auto; align-items: center; }
 .hitter-feature::after { content: attr(data-number); position: absolute; right: -5px; bottom: -52px; color: rgba(49,220,120,.08); font: 900 230px/1 "IBM Plex Mono", monospace; }
