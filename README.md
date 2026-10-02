@@ -188,6 +188,30 @@ node --test tests/test_app.js
 docker compose -f compose.yaml -f compose.local.yaml up -d --build
 ```
 
+### Compose 없이 단일 이미지 만들기
+
+웹 화면, API, 백그라운드 수집기와 SQLite 저장소가 한 컨테이너에서 실행됩니다. 별도 DB·웹 서버 컨테이너나 외부 Python 패키지는 필요하지 않습니다.
+
+```bash
+docker build -t kbo-game-predictor:local .
+docker run -d --name kbo-game-predictor --restart unless-stopped \
+  -p 8000:8000 -v playball_data:/data kbo-game-predictor:local
+```
+
+브라우저에서 <http://localhost:8000>을 엽니다. 배당 분석은 실행 시 `--env-file .env`를 추가하고 API 키를 설정하면 활성화됩니다. 실시간 KBO·날씨·배당 수집에는 네트워크가 필요합니다. `/data` 볼륨에 DB와 보정 파일이 저장되므로 컨테이너를 교체해도 자료가 유지됩니다.
+
+이미지를 파일로 옮길 수도 있습니다.
+
+```bash
+docker save kbo-game-predictor:local | gzip > kbo-game-predictor.tar.gz
+# 다른 Docker 호스트에서
+docker load -i kbo-game-predictor.tar.gz
+docker run -d --name kbo-game-predictor --restart unless-stopped \
+  -p 8000:8000 -v playball_data:/data kbo-game-predictor:local
+```
+
+로컬 빌드·이미지 파일은 빌드한 플랫폼용입니다. GHCR 배포 워크플로는 기존처럼 AMD64·ARM64 이미지를 함께 빌드합니다. 이미지 파일에는 실행 데이터 볼륨이 포함되지 않으므로 누적 기록을 다른 호스트로 옮길 때는 `/data`도 별도로 이전해야 합니다.
+
 ## 데이터와 백테스트
 
 컨테이너의 기본 저장소는 `/data/playball.db`이며 `playball_data` 볼륨에 보존됩니다. 관리형 PostgreSQL로 전환할 때 사용할 DDL은 [schema/postgresql.sql](schema/postgresql.sql)에 있습니다.
