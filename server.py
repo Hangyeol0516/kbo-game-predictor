@@ -214,7 +214,14 @@ def background_collector() -> None:
                 errors.append(f"analysis: {type(exc).__name__}")
                 print(f"background analysis failed: {exc}", flush=True)
         try:
-            STORE.sync_results(lambda date: games if schedule_ok and date == today else fetch_games(date))
+            def report_result_error(date, exc):
+                errors.append(f"results {date}: {type(exc).__name__}")
+                print(f"background result sync failed for {date}: {exc}", flush=True)
+
+            STORE.sync_results(
+                lambda date: games if schedule_ok and date == today else fetch_games(date),
+                on_error=report_result_error,
+            )
             COLLECTOR_STATE["lastResultSync"] = datetime.now(KST).isoformat(timespec="seconds")
         except Exception as exc:
             errors.append(f"results: {type(exc).__name__}")

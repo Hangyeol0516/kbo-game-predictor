@@ -105,6 +105,15 @@ CREATE INDEX IF NOT EXISTS idx_prediction_events_game ON prediction_events(predi
 KST = timezone(timedelta(hours=9))
 
 
+class ResultSyncError(RuntimeError):
+    """날짜별 결과 동기화 후 일부 날짜가 실패했음을 알린다."""
+
+    def __init__(self, saved: int, failed_dates: list[str]) -> None:
+        self.saved = saved
+        self.failed_dates = failed_dates
+        super().__init__(f"결과 {saved}건 저장, 실패 날짜: {', '.join(failed_dates)}")
+
+
 class PredictionStore:
     def __init__(self, db_path: str | None = None) -> None:
         configured = db_path or os.environ.get("PLAYBALL_DB_PATH", "data/playball.db")
@@ -424,10 +433,23 @@ class PredictionStore:
                 saved += 1
         return saved
 
-    def sync_results(self, game_fetcher: Callable[[str], list[dict[str, Any]]]) -> int:
+    def sync_results(
+        self,
+        game_fetcher: Callable[[str], list[dict[str, Any]]],
+        on_error: Callable[[str, Exception], None] | None = None,
+    ) -> int:
+        """각 날짜를 독립적으로 동기화하고, 실패는 선택 콜백으로 알린다."""
         saved = 0
+        failed_dates = []
         for prediction_date in self.pending_dates():
-            saved += self.save_completed_games(game_fetcher(prediction_date))
+            try:
+                saved += self.save_completed_games(game_fetcher(prediction_date))
+            except Exception as exc:
+                failed_dates.append(prediction_date)
+                if on_error is not None:
+                    on_error(prediction_date, exc)
+        if failed_dates and on_error is None:
+            raise ResultSyncError(saved, failed_dates)
         return saved
 
     def evaluated_predictions(self, model_version: str | None = None) -> list[dict[str, Any]]:

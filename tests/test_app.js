@@ -69,7 +69,7 @@ test("an open page removes its recommendation exactly at the cutoff without anot
   context.payload = payload(now.value);
   vm.runInContext("state.data = payload; renderAnalysis()", context);
   assert.match(elements.get("#valueContent").innerHTML, /역배 PICK/);
-  const timer = [...timers.values()][0];
+  const timer = [...timers.values()].find(timer => timer.delay === 60000);
   assert.equal(timer.delay, 60000);
   now.value += 60000;
   timer.callback();
@@ -83,7 +83,7 @@ test("price freshness expiration removes a recommendation on the open page", () 
   const { context, elements, timers } = browser(now);
   context.payload = payload(now.value, { startMinutes: 120, priceAge: 59 });
   vm.runInContext("state.data = payload; renderAnalysis()", context);
-  const timer = [...timers.values()][0];
+  const timer = [...timers.values()].find(timer => timer.delay === 60001);
   assert.equal(timer.delay, 60001);
   now.value += 60001;
   timer.callback();
@@ -96,9 +96,10 @@ test("changing dates cancels the previous page's expiration timer", () => {
   const { context, timers } = browser(now);
   context.payload = payload(now.value);
   vm.runInContext("state.data = payload; renderAnalysis()", context);
-  assert.equal(timers.size, 1);
+  const expiry = [...timers.keys()].find(id => timers.get(id).delay === 60000);
+  assert.ok(expiry);
   vm.runInContext("changeDate(1)", context);
-  assert.equal(timers.size, 0);
+  assert.equal(timers.has(expiry), false);
 });
 
 test("historical recommendations are preserved and clearly labeled as past decisions", () => {
@@ -110,7 +111,7 @@ test("historical recommendations are preserved and clearly labeled as past decis
   assert.match(elements.get("#valueContent").innerHTML, /당시 역배 PICK/);
   assert.match(elements.get("#dataNotice").innerHTML, /저장된 당시 예측/);
   assert.doesNotMatch(elements.get("#dataNotice").innerHTML, /LIVE DATA/);
-  assert.equal(timers.size, 0);
+  assert.equal([...timers.values()].some(timer => timer.delay === 60000 || timer.delay === 60001), false);
 });
 
 test("missing historical records are not presented as a date without games", () => {
@@ -157,6 +158,22 @@ test("share links restore date, team and history mode and discard impossible dat
   assert.equal(vm.runInContext("state.team", invalid.context), "all");
 });
 
+test("shared hitter position survives initial loading and falls back only after data arrives", () => {
+  const { context, elements } = browser({ value: Date.parse("2026-10-02T09:00:00Z") },
+    { href: "http://localhost/?position=포수" });
+  assert.equal(vm.runInContext("state.position", context), "포수");
+  assert.match(context.window.location.href, /position=%ED%8F%AC%EC%88%98/);
+  context.payload = { ...payload(Date.parse("2026-10-02T09:00:00Z")), hitters: { "전체": [], "포수": [] } };
+  vm.runInContext("state.data = payload; renderAnalysis()", context);
+  assert.equal(vm.runInContext("state.position", context), "포수");
+  assert.equal(new URL(context.window.location.href).searchParams.get("position"), "포수");
+  context.payload.hitters = { "전체": [] };
+  vm.runInContext("renderAnalysis()", context);
+  assert.equal(vm.runInContext("state.position", context), "전체");
+  assert.doesNotMatch(context.window.location.href, /position=/);
+  assert.match(elements.get("#positionFilters").innerHTML, /전체/);
+});
+
 test("team filtering uses game-level hitter lists instead of filtering an already truncated global top three", () => {
   const now = { value: Date.parse("2026-10-02T09:00:00Z") };
   const { context, elements } = browser(now);
@@ -201,17 +218,115 @@ test("background refresh failure keeps the previous display and suspends recomme
   assert.equal(vm.runInContext('state.expanded.has("one")', context), true);
 });
 
+test("silent refresh keeps the existing cutoff timer running while the request is pending", async () => {
+  const now = { value: Date.parse("2026-10-02T09:00:00Z") };
+  const { context, elements, timers } = browser(now);
+  context.payload = payload(now.value);
+  vm.runInContext("state.data = payload; renderAnalysis()", context);
+  const expiry = [...timers.entries()].find(([, timer]) => timer.delay === 60000);
+  assert.ok(expiry);
+  context.fetch = () => new Promise(() => {});
+  const pending = vm.runInContext("loadAnalysis({ silent: true })", context);
+  assert.ok([...timers.values()].some(timer => timer.delay === 60000));
+  now.value += 60001;
+  timers.delete(expiry[0]); expiry[1].callback();
+  assert.doesNotMatch(elements.get("#valueContent").innerHTML, /역배 PICK/);
+  assert.match(elements.get("#valueContent").innerHTML, /NO BET/);
+  vm.runInContext("changeDate(1)", context);
+  await pending;
+});
+
+test("analysis timeout covers JSON parsing and a later request can recover", async () => {
+  const now = { value: Date.parse("2026-10-02T09:00:00Z") };
+  const { context, elements, timers } = browser(now);
+  let bodyStarted = false;
+  let signal;
+  context.fetch = async (_, options) => {
+    signal = options.signal;
+    return { ok: true, json: () => { bodyStarted = true; return new Promise(() => {}); } };
+  };
+  const pending = vm.runInContext("loadAnalysis()", context);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(bodyStarted, true);
+  const expired = [...timers.entries()].find(([, timer]) => timer.delay === 180000);
+  assert.ok(expired);
+  timers.delete(expired[0]); expired[1].callback();
+  await pending;
+  assert.equal(signal.aborted, true);
+  assert.equal(timers.size, 0);
+  assert.match(elements.get("#dataNotice").textContent, /요청 시간이 초과/);
+  assert.equal(elements.get("#refreshButton").disabled, false);
+  context.fetch = async () => ({ ok: true, json: async () => ({ ...payload(now.value), date: "2026-10-02",
+    viewMode: "live", sources: ["test"], methodVersion: "test" }) });
+  await vm.runInContext("loadAnalysis()", context);
+  assert.match(elements.get("#gameGrid").innerHTML, /LG 트윈스/);
+});
+
+test("JSON body cancellation clears the previous deadline and ignores a late body", async () => {
+  const now = { value: Date.parse("2026-10-02T09:00:00Z") };
+  const { context, timers, elements } = browser(now);
+  let finishBody;
+  let signal;
+  context.fetch = async (_, options) => {
+    signal = options.signal;
+    return { ok: true, json: () => new Promise(resolve => { finishBody = resolve; }) };
+  };
+  const pending = vm.runInContext("loadAnalysis()", context);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof finishBody, "function");
+  const previousTimeout = [...timers.keys()].find(id => timers.get(id).delay === 180000);
+  context.fetch = () => new Promise(() => {});
+  vm.runInContext("changeDate(1)", context);
+  await pending;
+  assert.equal(signal.aborted, true);
+  assert.equal(timers.has(previousTimeout), false);
+  finishBody({ ...payload(now.value), date: "2026-10-02" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(vm.runInContext("state.data", context), null);
+  assert.match(elements.get("#gameGrid").innerHTML, /분석하고 있습니다/);
+});
+
+test("performance JSON timeout reports an error, clears its timer and can recover", async () => {
+  const { context, elements, timers } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
+  let bodyStarted = false;
+  let signal;
+  context.fetch = async (_, options) => {
+    signal = options.signal;
+    return { ok: true, json: () => { bodyStarted = true; return new Promise(() => {}); } };
+  };
+  const pending = vm.runInContext("loadPerformance()", context);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(bodyStarted, true);
+  const expired = [...timers.entries()].find(([, timer]) => timer.delay === 30000);
+  expired[1].callback();
+  await pending;
+  assert.equal(signal.aborted, true);
+  assert.equal(timers.has(expired[0]), false);
+  assert.match(elements.get("#performanceContent").innerHTML, /요청 시간이 초과/);
+  context.fetch = async () => ({ ok: true, json: async () => ({ recent: [], evaluatedGames: 9, modelVersion: "recovered" }) });
+  await vm.runInContext("loadPerformance()", context);
+  assert.match(elements.get("#performanceContent").innerHTML, /recovered/);
+  assert.equal([...timers.values()].some(timer => timer.delay === 30000), false);
+});
+
+test("date-change abort does not display a request error", async () => {
+  const { context, elements } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
+  vm.runInContext("changeDate(1)", context);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(elements.get("#dataNotice").innerHTML, /실패/);
+});
+
 test("automatic refresh runs for today's live view and pauses on hidden or historical pages", () => {
   const { context, elements, timers } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
   elements.get("#autoRefresh").checked = true;
   vm.runInContext("scheduleRefresh()", context);
-  assert.equal([...timers.values()][0].delay, 300000);
+  assert.ok([...timers.values()].some(timer => timer.delay === 300000));
   context.document.visibilityState = "hidden";
   vm.runInContext("scheduleRefresh()", context);
-  assert.equal(timers.size, 0);
+  assert.equal([...timers.values()].some(timer => timer.delay === 300000), false);
   context.document.visibilityState = "visible";
   vm.runInContext('state.mode = "historical"; scheduleRefresh()', context);
-  assert.equal(timers.size, 0);
+  assert.equal([...timers.values()].some(timer => timer.delay === 300000), false);
 });
 
 test("clearing the date picker does not request an invalid date", () => {
@@ -223,10 +338,12 @@ test("clearing the date picker does not request an invalid date", () => {
 test("scorecard response races keep the user's latest model selection", async () => {
   const { context, elements } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
   const pending = [];
-  context.fetch = () => new Promise(resolve => pending.push(resolve));
+  const signals = [];
+  context.fetch = (_, options) => { signals.push(options.signal); return new Promise(resolve => pending.push(resolve)); };
   vm.runInContext("loadPerformance()", context);
   elements.get("#performanceModel").value = "all";
   vm.runInContext("loadPerformance()", context);
+  assert.equal(signals[0].aborted, true);
   pending[1]({ ok: true, json: async () => ({ modelVersion: "all", recent: [], evaluatedGames: 9 }) });
   await new Promise(resolve => setImmediate(resolve));
   pending[0]({ ok: true, json: async () => ({ modelVersion: "old", recent: [], evaluatedGames: 1 }) });

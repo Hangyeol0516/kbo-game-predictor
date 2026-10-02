@@ -25,10 +25,12 @@ if (output) fs.mkdirSync(output, { recursive: true });
       favorite:metrics(away,54,1.55),underdog:metrics(home,46,2.7),returnAdvantagePp:20,
       quality:{marketFresh:true,bettingOpen:true,enoughBookmakers:true},
       criterion:{maximumAgeMinutes:60,closeBeforeMinutes:10,minimumBookmakers:2,minimumEvPct:8,minimumEdgePp:5,minimumAdvantagePp:10}} });
-  const hitters = {'전체':[player('두산','선수 하나','one',81),player('LG','선수 둘','one',79),player('NC','선수 셋','two',75)]};
+  const players = [player('두산','선수 하나','one',81),player('LG','선수 둘','one',79),player('NC','선수 셋','two',75)];
+  const hitters = {'전체':players,'포수':players};
   const payload = {date:today, updatedAt:at, sources:['KBO 공식 홈페이지'], source:'KBO 공식 홈페이지', methodVersion:'test',
     lineupStatus:'confirmed', valueBetStatus:'connected',viewMode:'live',games:[game('one','LG','두산'),game('two','삼성','NC')],hitters,
-    hittersByGame:{one:{'전체':hitters['전체'].slice(0,2)},two:{'전체':hitters['전체'].slice(2)}},dataQuality:{warnings:[]}};
+    hittersByGame:{one:{'전체':players.slice(0,2),'포수':players.slice(0,2)},
+      two:{'전체':players.slice(2),'포수':players.slice(2)}},dataQuality:{warnings:[]}};
   const performance={ evaluatedGames:100,decidedGames:100,correctGames:60,accuracy:60,brierScore:.23,modelVersion:'test',
     accuracyInterval95:[50.2,69.1],baseline:{homeWinAccuracy:51},calibration:[{predicted:55,observed:60,samples:100}],
     valueBet:{recommended:10,settled:10,wins:4,roi:8,profitUnits:.8},recent:[{date:today,away:'LG',home:'두산',score:'4 : 2',pick:'LG',winner:'LG',correct:true}] };
@@ -37,20 +39,34 @@ if (output) fs.mkdirSync(output, { recursive: true });
   for (const width of [1440,390,320]) {
     const context=await browser.newContext({viewport:{width,height:1000},timezoneId:'America/Los_Angeles',reducedMotion:'reduce'});
     const page=await context.newPage();
+    await page.clock.install({time:now});
     const errors=[];page.on('pageerror',error=>errors.push(error.message));
+    let holdAnalysis=false, expiryMode='', fixtureNow=now;
+    const heldRoutes=[];
     await page.route('**/api/analysis?*', async route=>{
+      if(holdAnalysis){heldRoutes.push(route);return;}
       if(fail) return route.fulfill({status:502,contentType:'application/json',body:JSON.stringify({error:'테스트 연결 실패'})});
       const selected=new URL(route.request().url()).searchParams.get('date');
       const historical=selected<today;
       const data=JSON.parse(JSON.stringify(payload));data.date=selected;
+      if(expiryMode){
+        for(const game of data.games){
+          const updated=new Date(fixtureNow-(expiryMode==='price'?59*60000:0)).toISOString();
+          game.valueBet.lastUpdate=updated;
+          game.valueBet.favorite.lastUpdate=updated;game.valueBet.underdog.lastUpdate=updated;
+          game.valueBet.commenceTime=new Date(fixtureNow+(expiryMode==='cutoff'?11:120)*60000).toISOString();
+        }
+      }
       if(historical){data.viewMode='historical';data.games[0].predictionAt=at;data.games[0].result={awayScore:4,homeScore:2,winner:'LG',correct:true};
         data.games[0].predictionHistory=[{at,lineupStatus:'projected',homeProb:46,recommended:true,underdog:'두산',odds:2.7,modelVersion:'test'},
         {at,lineupStatus:'confirmed',homeProb:47,recommended:false,modelVersion:'test'}];}
       await route.fulfill({contentType:'application/json',body:JSON.stringify(data)});
     });
     await page.route('**/api/performance*',route=>route.fulfill({contentType:'application/json',body:JSON.stringify(performance)}));
-    await page.goto(`${base}/?date=${today}`);
+    await page.goto(`${base}/?date=${today}&position=${encodeURIComponent('포수')}`);
     await page.locator('.game-card').first().waitFor();
+    assert.equal(await page.locator('.position-button.active').textContent(),'포수');
+    assert.equal(new URL(page.url()).searchParams.get('position'),'포수');
     await page.keyboard.press('Tab');
     assert.equal(await page.evaluate(()=>document.activeElement.classList.contains('skip-link')), true);
     await page.keyboard.press('Enter');
@@ -91,6 +107,29 @@ if (output) fs.mkdirSync(output, { recursive: true });
     fail=false;
     await page.locator('#refreshButton').click();
     await page.waitForFunction(()=>!document.querySelector('#refreshButton').disabled);
+    for(const mode of ['cutoff','price']){
+      expiryMode=mode;fixtureNow=await page.evaluate(()=>Date.now());
+      await page.locator('#refreshButton').click();
+      await page.waitForFunction(()=>!document.querySelector('#refreshButton').disabled);
+      assert.equal(await page.locator('.value-card.recommended').count(),1);
+      holdAnalysis=true;
+      const requested=page.waitForRequest('**/api/analysis?*');
+      await page.locator('#refreshButton').click();await requested;
+      await page.clock.fastForward(60001);
+      assert.equal(await page.locator('#refreshButton').isDisabled(),true);
+      assert.equal(await page.locator('.value-card.recommended').count(),0,`${mode} during pending refresh at ${width}`);
+      await page.clock.fastForward(120000);
+      await page.locator('.refresh-error').waitFor();
+      assert.match(await page.locator('.refresh-error').textContent(),/요청 시간이 초과/);
+      assert.equal(await page.locator('#refreshButton').isDisabled(),false);
+      assert.equal(await page.locator('.game-card').count(),1);
+      holdAnalysis=false;expiryMode='';
+      for(const route of heldRoutes.splice(0)) await route.abort().catch(()=>{});
+      await page.locator('#refreshButton').click();
+      await page.waitForFunction(()=>!document.querySelector('#refreshButton').disabled);
+      assert.equal(await page.locator('.value-card.recommended').count(),1);
+      assert.equal(await page.locator('.refresh-error').count(),0);
+    }
     const axe=await new AxeBuilder({page}).withTags(['wcag2a','wcag2aa','wcag21aa']).analyze();
     report.push({width,errors,violations:axe.violations.map(v=>({id:v.id,impact:v.impact,nodes:v.nodes.map(n=>({target:n.target,summary:n.failureSummary}))}))});
     if(output) await page.screenshot({path:path.join(output,`playball-${width}.png`),fullPage:true});

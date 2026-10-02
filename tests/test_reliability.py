@@ -22,6 +22,20 @@ class CollectorContinuityTest(unittest.TestCase):
         self.assertIsNone(server.collector_odds_slot(games, now.replace(hour=17)))
         self.assertTrue(server.collector_analysis_due(games, now.replace(hour=17)))
 
+    def test_result_sync_failure_is_visible_in_collector_state_with_date(self):
+        def sync(_fetcher, on_error=None):
+            on_error("2026-09-30", OSError("temporary"))
+            return 1
+
+        with patch("server.fetch_games", return_value=[]), \
+             patch("server.collector_analysis_due", return_value=False), \
+             patch.object(server.STORE, "sync_results", side_effect=sync), \
+             patch("server.time.sleep", side_effect=KeyboardInterrupt):
+            server.COLLECTOR_STATE["lastError"] = None
+            with self.assertRaises(KeyboardInterrupt):
+                server.background_collector()
+        self.assertEqual(server.COLLECTOR_STATE["lastError"], "results 2026-09-30: OSError")
+
 
 class StorageReliabilityTest(unittest.TestCase):
     def setUp(self):

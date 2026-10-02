@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from storage import PredictionStore
+from storage import PredictionStore, ResultSyncError
 
 
 class PredictionStoreTest(unittest.TestCase):
@@ -199,6 +199,44 @@ class PredictionStoreTest(unittest.TestCase):
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertTrue({"bookmaker_count", "market_age_minutes", "betting_open"}.issubset(columns))
         self.assertEqual(version, 4)
+
+    def test_result_sync_continues_after_a_date_failure_and_retries_it_next_cycle(self):
+        dates = ["2026-04-01", "2026-04-02"]
+        with patch.object(self.store, "pending_dates", return_value=dates):
+            attempts = []
+            errors = []
+
+            def fetch(day):
+                attempts.append(day)
+                if day == dates[0] and attempts.count(day) == 1:
+                    raise OSError("temporary failure")
+                return [{"G_ID": day, "G_DT": day.replace("-", ""), "AWAY_NM": "LG", "HOME_NM": "두산",
+                         "T_SCORE_CN": 2, "B_SCORE_CN": 4, "GAME_RESULT_CK": True}]
+
+            self.assertEqual(self.store.sync_results(fetch, on_error=lambda day, exc: errors.append(day)), 1)
+            with self.store.connect() as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM game_results").fetchone()[0], 1)
+            self.assertEqual(errors, [dates[0]])
+            self.assertEqual(self.store.sync_results(fetch, on_error=lambda day, exc: errors.append(day)), 2)
+            with self.store.connect() as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM game_results").fetchone()[0], 2)
+
+    def test_result_sync_without_error_callback_raises_aggregate_after_continuing(self):
+        with patch.object(self.store, "pending_dates", return_value=["2026-04-01", "2026-04-02"]):
+            calls = []
+
+            def fetch(day):
+                calls.append(day)
+                if day.endswith("01"):
+                    raise OSError("temporary failure")
+                return [{"G_ID": day, "G_DT": day.replace("-", ""), "AWAY_NM": "LG", "HOME_NM": "두산",
+                         "T_SCORE_CN": 2, "B_SCORE_CN": 4, "GAME_RESULT_CK": True}]
+
+            with self.assertRaises(ResultSyncError) as caught:
+                self.store.sync_results(fetch)
+        self.assertEqual(calls, ["2026-04-01", "2026-04-02"])
+        self.assertEqual(caught.exception.failed_dates, ["2026-04-01"])
+        self.assertEqual(caught.exception.saved, 1)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ const teams = {
 const todayKst = () => new Date(`${new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10)}T12:00:00`);
 const state = { date: todayKst(), mode: "auto", position: "전체", team: "all", hitterGame: "all", data: null,
   loading: false, requestId: 0, lastChecked: 0, refreshError: "", expanded: new Set() };
-let analysisController, refreshTimer, performanceRequestId = 0;
+let analysisController, performanceController, refreshTimer, performanceRequestId = 0;
 const REFRESH_INTERVAL = 5 * 60000;
 let valueExpiryTimer;
 const pad = (number) => String(number).padStart(2, "0");
@@ -149,7 +149,7 @@ function renderValueBets() {
 function renderFilters() {
   const filter = document.querySelector("#positionFilters");
   const positions = Object.keys(visibleHitters());
-  if (!positions.includes(state.position)) state.position = positions[0] || "전체";
+  if (state.data && !positions.includes(state.position)) state.position = positions[0] || "전체";
   filter.innerHTML = positions.map(position => `<button type="button" aria-pressed="${state.position === position}" class="position-button ${state.position === position ? "active" : ""}" data-position="${escapeHtml(position)}">${escapeHtml(position)}</button>`).join("");
   filter.querySelectorAll("button").forEach(button => button.addEventListener("click", () => {
     state.position = button.dataset.position; syncViewUrl(); renderFilters(); renderHitters();
@@ -195,6 +195,42 @@ function updateValueBetTime() {
   return deadlines.length ? Math.min(...deadlines) : null;
 }
 
+async function fetchJson(url, controller, timeoutMs) {
+  let timedOut = false;
+  let timeoutId;
+  let rejectAbort;
+  const aborted = new Promise((_, reject) => {
+    rejectAbort = () => {
+      if (timedOut) return;
+      const error = new Error("요청이 취소됐습니다.");
+      error.name = "AbortError";
+      reject(error);
+    };
+    controller.signal.addEventListener("abort", rejectAbort, { once: true });
+  });
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error("요청 시간이 초과됐습니다. 다시 시도해 주세요.");
+      error.name = "TimeoutError";
+      reject(error);
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  });
+  const request = (async () => {
+    const response = await fetch(url, { signal: controller.signal });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "요청에 실패했습니다.");
+    return payload;
+  })();
+  try {
+    return await Promise.race([request, timeout, aborted]);
+  } finally {
+    clearTimeout(timeoutId);
+    controller.signal.removeEventListener("abort", rejectAbort);
+  }
+}
+
 function renderAnalysis() {
   const nextExpiry = updateValueBetTime();
   clearTimeout(valueExpiryTimer);
@@ -215,13 +251,14 @@ function renderAnalysis() {
 }
 
 async function loadPerformance() {
+  performanceController?.abort();
   const requestId = ++performanceRequestId;
+  const controller = new AbortController();
+  performanceController = controller;
   const container = document.querySelector("#performanceContent");
   try {
     const version = document.querySelector("#performanceModel").value === "all" ? "?modelVersion=all" : "";
-    const response = await fetch(`/api/performance${version}`);
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "성능 정보를 불러오지 못했습니다.");
+    const data = await fetchJson(`/api/performance${version}`, controller, 30000);
     if (requestId !== performanceRequestId) return;
     const metric = (value, suffix = "") => value === null ? "—" : `${value}${suffix}`;
     const value = data.valueBet || { recommended: 0, settled: 0, wins: 0, roi: null, profitUnits: 0 };
@@ -239,7 +276,7 @@ async function loadPerformance() {
       <article><span>홈팀 선택 기준선</span><strong>${metric(data.baseline?.homeWinAccuracy ?? null, "%")}</strong><small>모든 경기에서 홈팀을 골랐을 때</small></article>
     </div>${recent}${data.calibration?.length ? `<div class="calibration-summary"><h3>확률과 실제 결과 비교</h3><p>홈팀의 예측 승률별 실제 승률입니다. 표본이 적을수록 변동이 큽니다.</p><table><caption class="sr-only">홈팀 확률 보정 점검</caption><thead><tr><th scope="col">평균 예측</th><th scope="col">실제 승률</th><th scope="col">경기 수</th></tr></thead><tbody>${data.calibration.map(bucket => `<tr><td>${bucket.predicted}%</td><td>${bucket.observed}%</td><td>${bucket.samples}</td></tr>`).join("")}</tbody></table></div>` : ""}`;
   } catch (error) {
-    if (requestId !== performanceRequestId) return;
+    if (requestId !== performanceRequestId || error.name === "AbortError") return;
     container.innerHTML = `<div class="empty-state error-state"><strong>성능 정보를 표시할 수 없습니다.</strong>${escapeHtml(error.message)}</div>`;
   }
 }
@@ -322,9 +359,11 @@ function scheduleRefresh() {
 
 async function loadAnalysis({ silent = false } = {}) {
   analysisController?.abort();
-  analysisController = new AbortController();
+  const controller = new AbortController();
+  analysisController = controller;
   const requestId = ++state.requestId;
-  clearTimeout(valueExpiryTimer); clearTimeout(refreshTimer);
+  if (!silent || !state.data) clearTimeout(valueExpiryTimer);
+  clearTimeout(refreshTimer);
   state.loading = true;
   if (!silent || !state.data) {
     state.data = null; state.refreshError = ""; state.expanded.clear(); renderLoading(); renderFilters();
@@ -335,9 +374,7 @@ async function loadAnalysis({ silent = false } = {}) {
   document.querySelector("#exportButton").disabled = !state.data;
   document.querySelector("#updateStatus").textContent = "확인 중…";
   try {
-    const response = await fetch(`/api/analysis?date=${toInputDate(state.date)}&mode=${state.mode}`, { signal: analysisController.signal });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "알 수 없는 오류가 발생했습니다.");
+    const payload = await fetchJson(`/api/analysis?date=${toInputDate(state.date)}&mode=${state.mode}`, controller, 180000);
     if (requestId !== state.requestId) return;
     state.data = payload; state.refreshError = ""; state.lastChecked = Date.now(); renderAnalysis(); loadPerformance();
     document.querySelector("#updateStatus").textContent = `${formatUpdated(state.lastChecked)} 확인 · 한국 시각`;
