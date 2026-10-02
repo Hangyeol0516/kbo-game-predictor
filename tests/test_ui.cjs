@@ -21,6 +21,10 @@ if (output) fs.mkdirSync(output, { recursive: true });
     awayPitcher:'테스트선발', homePitcher:'테스트선발', awayProb:54, homeProb:46, pick:away, confidence:'접전',
     startsAt: new Date(now+4*3600000).toISOString(), status:'scheduled', lineupConfirmed:true,
     reasons:['시즌 기록 기준 분석', '<script>공격 문자열</script>'], weather:{summary:'맑음'},
+    lineups: Object.fromEntries(['away','home'].map(side=>[side,Array.from({length:9},(_,index)=>({order:index+1,name:`${side} 선수 ${index+1}`,position:'중견수'}))])),
+    metrics:{awayRpg:4.8,homeRpg:4.2,awayEra:3.5,homeEra:4.1,awayStarterEra:2.9,homeStarterEra:null,awayBullpenPitches3d:180,homeBullpenPitches3d:210},
+    predictionHistory:[{at:new Date(now-3600000).toISOString(),homeProb:44,modelVersion:'test-old',lineupStatus:'projected',recommended:true,underdog:home,odds:2.7,changes:['첫 저장']},
+      {at,homeProb:46,modelVersion:'test',lineupStatus:'confirmed',recommended:false,changes:['모델 변경','라인업 상태 변경','추천 철회'],reasons:['저장된 실제 근거 <script>']}],
     valueBet:{available:true,recommendation:true,bookmakerCount:2,lastUpdate:at,commenceTime:new Date(now+4*3600000).toISOString(),
       favorite:metrics(away,54,1.55),underdog:metrics(home,46,2.7),returnAdvantagePp:20,
       quality:{marketFresh:true,bettingOpen:true,enoughBookmakers:true},
@@ -32,6 +36,9 @@ if (output) fs.mkdirSync(output, { recursive: true });
     hittersByGame:{one:{'전체':players.slice(0,2),'포수':players.slice(0,2)},
       two:{'전체':players.slice(2),'포수':players.slice(2)}},dataQuality:{warnings:[]}};
   const performance={ evaluatedGames:100,decidedGames:100,correctGames:60,accuracy:60,brierScore:.23,modelVersion:'test',
+    monthly:[{month:today.slice(0,7),decidedGames:100,dates:10,accuracy:60,brierScore:.23}],
+    pagination:{page:1,pages:10,total:100},filters:{start:null,end:null,team:null},
+    modelBreakdown:[{modelVersion:'test',evaluatedGames:100}],
     evaluationStatus:{message:'표본 부족 · 최소 100경기와 20개 경기일을 기다리고 있습니다.',decidedGames:100,dates:10,sufficientSample:false},
     accuracyInterval95:[50.2,69.1],baseline:{homeWinAccuracy:51},calibration:[{predicted:55,observed:60,samples:100}],
     valueBet:{recommended:10,settled:10,wins:4,roi:8,profitUnits:.8},recent:[{date:today,away:'LG',home:'두산',score:'4 : 2',pick:'LG',winner:'LG',correct:true}] };
@@ -42,7 +49,7 @@ if (output) fs.mkdirSync(output, { recursive: true });
     const page=await context.newPage();
     await page.clock.install({time:now});
     const errors=[];page.on('pageerror',error=>errors.push(error.message));
-    let holdAnalysis=false, expiryMode='', fixtureNow=now;
+    let holdAnalysis=false, expiryMode='', fixtureNow=now, lastPerformanceQuery, scheduleCase='normal';
     const heldRoutes=[];
     await page.route('**/api/analysis?*', async route=>{
       if(holdAnalysis){heldRoutes.push(route);return;}
@@ -50,6 +57,15 @@ if (output) fs.mkdirSync(output, { recursive: true });
       const selected=new URL(route.request().url()).searchParams.get('date');
       const historical=selected<today;
       const data=JSON.parse(JSON.stringify(payload));data.date=selected;
+      if(scheduleCase==='cancelled'){
+        data.games=[{id:'rain',away:'LG',home:'KIA',time:'17:00',park:'광주',status:'cancelled',officialStatus:'우천취소',
+          homeProb:null,awayProb:null,pick:'—',confidence:'예측 보류',lineupConfirmed:false,snapshotEligible:false,
+          awayPitcher:'미정',homePitcher:'미정',reasons:[],valueBet:{available:false,recommendation:false}}];
+        data.hitters={};data.hittersByGame={};data.valueBetStatus='no-market';
+      }else if(scheduleCase==='empty'){
+        data.games=[];data.hitters={};data.hittersByGame={};
+        data.collectorStatus={lastError:'results: OSError',enabled:true,intervalSeconds:1200};
+      }
       if(expiryMode){
         for(const game of data.games){
           const updated=new Date(fixtureNow-(expiryMode==='price'?59*60000:0)).toISOString();
@@ -63,7 +79,15 @@ if (output) fs.mkdirSync(output, { recursive: true });
         {at,lineupStatus:'confirmed',homeProb:47,recommended:false,modelVersion:'test'}];}
       await route.fulfill({contentType:'application/json',body:JSON.stringify(data)});
     });
-    await page.route('**/api/performance*',route=>route.fulfill({contentType:'application/json',body:JSON.stringify(performance)}));
+    await page.route('**/api/performance*',route=>{
+      const query=new URL(route.request().url()).searchParams;lastPerformanceQuery=query;
+      const data=JSON.parse(JSON.stringify(performance));
+      data.filters={start:query.get('start'),end:query.get('end'),team:query.get('team')};
+      data.pagination.page=Number(query.get('page')||1);
+      data.recent[0].pick=data.pagination.page>1?'두산':'LG';
+      data.recent[0].modelVersion='test';data.recent[0].lineupStatus='confirmed';
+      return route.fulfill({contentType:'application/json',body:JSON.stringify(data)});
+    });
     await page.goto(`${base}/?date=${today}&position=${encodeURIComponent('포수')}`);
     await page.locator('.game-card').first().waitFor();
     await page.locator('.evaluation-note').waitFor();
@@ -78,10 +102,45 @@ if (output) fs.mkdirSync(output, { recursive: true });
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth), true, `date focus overflow at ${width}`);
     await page.locator('#refreshButton').focus();
     assert.equal(await page.locator('.game-card').count(),2);
+    assert.match(await page.locator('#summaryContent').textContent(),/최근 변경 2경기/);
     assert.equal(await page.locator('.value-card.recommended').count(),2);
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,`overflow at ${width}`);
     const initialAxe=await new AxeBuilder({page}).withTags(['wcag2a','wcag2aa','wcag21aa']).analyze();
     assert.deepEqual(initialAxe.violations.map(v=>({id:v.id,nodes:v.nodes.map(n=>n.target)})), [], `initial accessibility at ${width}`);
+    await page.locator('.detail-button').first().click();
+    assert.equal(await page.locator('#gameDetail').evaluate(dialog=>dialog.open),true);
+    assert.equal(await page.locator('.lineup-list li').count(),18);
+    assert.match(await page.locator('#detailContent').textContent(),/미제공/);
+    assert.match(await page.locator('#detailContent').textContent(),/추천 철회/);
+    assert.equal(await page.locator('.history-chart line').count(),0);
+    assert.equal(await page.locator('#detailContent script').count(),0);
+    await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(()=>document.querySelector('#gameDetail').contains(document.activeElement)),true);
+    const detailAxe=await new AxeBuilder({page}).withTags(['wcag2a','wcag2aa','wcag21aa']).analyze();
+    assert.deepEqual(detailAxe.violations.map(v=>({id:v.id,nodes:v.nodes.map(n=>n.target)})), [], `detail accessibility at ${width}`);
+    if(output) await page.screenshot({path:path.join(output,`detail-${width}.png`)});
+    await page.keyboard.press('Escape');
+    assert.equal(await page.locator('#gameDetail').evaluate(dialog=>dialog.open),false);
+    assert.equal(await page.evaluate(()=>document.activeElement.classList.contains('detail-button')),true);
+    await page.locator('.detail-button').first().click();
+    await page.evaluate(()=>changeDate(-1));
+    await page.waitForFunction(()=>!document.querySelector('#refreshButton').disabled);
+    assert.equal(await page.locator('#gameDetail').evaluate(dialog=>dialog.open),false);
+    await page.locator('#todayButton').click();
+    await page.waitForFunction(()=>!document.querySelector('#refreshButton').disabled);
+    await page.locator('#performanceStart').fill(today.slice(0,7)+'-01');
+    await page.selectOption('#performanceTeam','LG');
+    await page.locator('#performanceApply').click();
+    await page.waitForFunction(()=>document.querySelector('#performanceScope').textContent.includes('LG'));
+    assert.equal(lastPerformanceQuery.get('team'),'LG');
+    assert.equal(lastPerformanceQuery.get('start'),today.slice(0,7)+'-01');
+    await page.locator('#performanceNext').click();
+    await page.waitForFunction(()=>document.querySelector('#performancePage').textContent.startsWith('2 /'));
+    assert.match(await page.locator('.performance-history').textContent(),/예측 두산/);
+    await page.locator('#performanceReset').click();
+    await page.waitForFunction(()=>document.querySelector('#performancePage').textContent.startsWith('1 /'));
+    assert.equal(lastPerformanceQuery.has('team'),false);
+    assert.equal(lastPerformanceQuery.has('start'),false);
     await page.selectOption('#hitterGame','two');
     assert.match(await page.locator('.hitter-name').textContent(),/선수 셋/);
     await page.selectOption('#hitterGame','all');
@@ -118,7 +177,11 @@ if (output) fs.mkdirSync(output, { recursive: true });
       holdAnalysis=true;
       const requested=page.waitForRequest('**/api/analysis?*');
       await page.locator('#refreshButton').click();await requested;
+      await page.locator('.detail-button').first().click();
+      await page.locator('.table-scroll').focus();
       await page.clock.fastForward(60001);
+      assert.equal(await page.locator('#gameDetail').evaluate(dialog=>dialog.open),true);
+      assert.equal(await page.evaluate(()=>document.querySelector('#gameDetail').contains(document.activeElement)),true);
       assert.equal(await page.locator('#refreshButton').isDisabled(),true);
       assert.equal(await page.locator('.value-card.recommended').count(),0,`${mode} during pending refresh at ${width}`);
       await page.clock.fastForward(120000);
@@ -126,6 +189,8 @@ if (output) fs.mkdirSync(output, { recursive: true });
       assert.match(await page.locator('.refresh-error').textContent(),/요청 시간이 초과/);
       assert.equal(await page.locator('#refreshButton').isDisabled(),false);
       assert.equal(await page.locator('.game-card').count(),1);
+      assert.match(await page.locator('#detailContent').textContent(),/최신 수집 실패/);
+      await page.keyboard.press('Escape');
       holdAnalysis=false;expiryMode='';
       for(const route of heldRoutes.splice(0)) await route.abort().catch(()=>{});
       await page.locator('#refreshButton').click();
@@ -133,6 +198,26 @@ if (output) fs.mkdirSync(output, { recursive: true });
       assert.equal(await page.locator('.value-card.recommended').count(),1);
       assert.equal(await page.locator('.refresh-error').count(),0);
     }
+    scheduleCase='cancelled';await page.locator('#refreshButton').click();
+    await page.waitForFunction(()=>!document.querySelector('#refreshButton').disabled);
+    assert.match(await page.locator('.game-status').textContent(),/우천취소/);
+    assert.equal(await page.locator('.probability-row').count(),0);
+    assert.equal(await page.locator('.value-card.recommended').count(),0);
+    await page.locator('.detail-button').click();
+    assert.match(await page.locator('#detailContent').textContent(),/라인업 자료가 제공/);
+    assert.match(await page.locator('#detailContent').textContent(),/저장된 경기 전 예측 이력이 없습니다/);
+    const cancelAxe=await new AxeBuilder({page}).withTags(['wcag2a','wcag2aa','wcag21aa']).analyze();
+    assert.deepEqual(cancelAxe.violations.map(v=>v.id),[],`cancel detail accessibility at ${width}`);
+    await page.keyboard.press('Escape');
+    scheduleCase='empty';await page.locator('#refreshButton').click();
+    await page.waitForFunction(()=>!document.querySelector('#refreshButton').disabled);
+    assert.match(await page.locator('#summaryContent').textContent(),/자동 수집 일부 실패.*20분 간격/);
+    assert.match(await page.locator('#gameGrid').textContent(),/KBO 경기가 없습니다/);
+    scheduleCase='normal';fail=true;await page.reload();
+    await page.locator('#retryButton').waitFor();
+    assert.match(await page.locator('#summaryContent').textContent(),/경기 유무를 확인하지 못했습니다/);
+    fail=false;await page.locator('#retryButton').click();
+    await page.waitForFunction(()=>!document.querySelector('#refreshButton').disabled);
     const axe=await new AxeBuilder({page}).withTags(['wcag2a','wcag2aa','wcag21aa']).analyze();
     report.push({width,errors,violations:axe.violations.map(v=>({id:v.id,impact:v.impact,nodes:v.nodes.map(n=>({target:n.target,summary:n.failureSummary}))}))});
     if(output) await page.screenshot({path:path.join(output,`playball-${width}.png`),fullPage:true});

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from kbo_analysis import DataContractError, active_model_version, analyze, fetch_games, odds_provider_status
+from kbo_analysis import TEAM_CODES, DataContractError, active_model_version, analyze, cancelled_game, fetch_games, odds_provider_status
 from storage import PredictionStore
 
 
@@ -62,9 +62,33 @@ class AppHandler(SimpleHTTPRequestHandler):
             }, 503 if database_status == "error" else 200)
         if parsed.path == "/api/performance":
             try:
-                requested_version = parse_qs(parsed.query).get("modelVersion", [""])[0]
+                params = parse_qs(parsed.query)
+                requested_version = params.get("modelVersion", [""])[0]
                 model_version = None if requested_version == "all" else (requested_version or active_model_version())
-                return self.send_json(STORE.performance_summary(model_version))
+                filters = {}
+                for field in ("start", "end"):
+                    value = params.get(field, [""])[0]
+                    if value:
+                        if datetime.strptime(value, "%Y-%m-%d").date().isoformat() != value:
+                            raise ValueError("날짜 형식은 YYYY-MM-DD여야 합니다.")
+                        filters[field] = value
+                if filters.get("start", "") > filters.get("end", "9999-12-31"):
+                    raise ValueError("시작 날짜는 종료 날짜보다 늦을 수 없습니다.")
+                team = params.get("team", ["all"])[0]
+                if team != "all":
+                    if team not in TEAM_CODES.values():
+                        raise ValueError("지원하지 않는 구단입니다.")
+                    filters["team"] = team
+                for field, maximum in (("page", 1000000), ("pageSize", 50)):
+                    value = params.get(field, [""])[0]
+                    if value:
+                        number = int(value)
+                        if not 1 <= number <= maximum:
+                            raise ValueError("페이지 범위가 잘못됐습니다.")
+                        filters["page_size" if field == "pageSize" else field] = number
+                return self.send_json(STORE.performance_summary(model_version, **filters))
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, 400)
             except Exception as exc:
                 self.log_error("performance read failed: %s", exc)
                 return self.send_json({"error": "성능 데이터를 읽지 못했습니다."}, 500)
@@ -108,6 +132,13 @@ class AppHandler(SimpleHTTPRequestHandler):
                         game["valueBet"] = {"available": False, "recommendation": False, "reason": "현재 기록을 사용한 재분석"}
                 else:
                     STORE.save_analysis(analysis)
+                history = STORE.prediction_history(date)
+                for game in analysis["games"]:
+                    game["predictionHistory"] = history.get(game["id"], [])
+                analysis["collectorStatus"] = dict(COLLECTOR_STATE) | {
+                    "enabled": os.environ.get("PLAYBALL_COLLECTOR_ENABLED", "1") != "0",
+                    "intervalSeconds": env_int("PLAYBALL_COLLECT_INTERVAL_SECONDS", 900, 60),
+                }
                 return self.send_json(analysis)
             except DataContractError as exc:
                 self.log_error("upstream data invalid: %s", exc)
@@ -152,6 +183,8 @@ class AppHandler(SimpleHTTPRequestHandler):
 def _game_start_times(games: list[dict], now: datetime, include_started: bool = False) -> list[datetime]:
     starts = []
     for game in games:
+        if cancelled_game(game):
+            continue
         state = game.get("GAME_STATE_SC")
         try:
             hour, minute = map(int, str(game.get("G_TM", "")).strip()[:5].split(":"))

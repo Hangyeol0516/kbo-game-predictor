@@ -100,7 +100,7 @@ class StaticServerSecurityTest(unittest.TestCase):
 
     def test_explicit_past_reanalysis_is_marked_and_never_saved_or_recommends_bets(self):
         payload = {"date": "2026-04-01", "snapshotEligible": True,
-                   "games": [{"snapshotEligible": True, "valueBet": {"available": True, "recommendation": True}}]}
+                   "games": [{"id": "fixture", "snapshotEligible": True, "valueBet": {"available": True, "recommendation": True}}]}
         with patch("server.analyze", return_value=payload) as analyze, patch.object(server.STORE, "save_analysis") as save:
             with urlopen(f"{self.base_url}/api/analysis?date=2026-04-01&mode=reanalysis", timeout=2) as response:
                 result = json.load(response)
@@ -109,6 +109,33 @@ class StaticServerSecurityTest(unittest.TestCase):
         self.assertFalse(result["games"][0]["valueBet"]["recommendation"])
         analyze.assert_called_once_with("2026-04-01", force=False, refresh_odds=False)
         save.assert_not_called()
+
+    def test_performance_filters_are_validated_and_passed_to_store(self):
+        from urllib.parse import urlencode
+        params = {"start": "2026-04-01", "end": "2026-05-31", "team": "두산", "page": 2, "pageSize": 5, "modelVersion": "all"}
+        with patch.object(server.STORE, "performance_summary", return_value={"recent": []}) as summary:
+            with urlopen(f"{self.base_url}/api/performance?{urlencode(params)}", timeout=2):
+                pass
+        summary.assert_called_once_with(None, start="2026-04-01", end="2026-05-31", team="두산", page=2, page_size=5)
+        for query in ("start=2026-02-30", "start=2026-05-01&end=2026-04-01", "team=unknown", "page=0", "pageSize=51"):
+            with self.subTest(query=query), patch.object(server.STORE, "performance_summary") as summary:
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(f"{self.base_url}/api/performance?{query}", timeout=2)
+                self.assertEqual(error.exception.code, 400)
+                summary.assert_not_called()
+
+    def test_live_analysis_exposes_only_saved_event_history_and_collector_state(self):
+        payload = {"date": "2099-05-01", "games": [{"id": "fixture"}], "snapshotEligible": False}
+        events = {"fixture": [{"at": "2099-05-01T16:00:00+09:00", "homeProb": 45}]}
+        with patch("server.analyze", return_value=payload), patch.object(server.STORE, "save_analysis") as save, \
+             patch.object(server.STORE, "prediction_history", return_value=events) as history, \
+             patch.dict(server.COLLECTOR_STATE, {"lastError": "results: OSError"}):
+            with urlopen(f"{self.base_url}/api/analysis?date=2099-05-01", timeout=2) as response:
+                result = json.load(response)
+        history.assert_called_once_with("2099-05-01")
+        self.assertEqual(result["games"][0]["predictionHistory"], events["fixture"])
+        self.assertEqual(result["collectorStatus"]["lastError"], "results: OSError")
+        self.assertTrue(save.called)
 
     def test_invalid_upstream_records_report_a_data_quality_error(self):
         with patch("server.analyze", side_effect=server.DataContractError("팀 기록: 컬럼 누락")):

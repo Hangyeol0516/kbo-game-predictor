@@ -1082,6 +1082,9 @@ def _current_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
                 }
             else:
                 _update_value_bet_quality(value, now)
+                if game.get("status") in ("completed", "in-progress", "cancelled", "unavailable"):
+                    value["quality"]["bettingOpen"] = False
+                    value["recommendation"] = False
     if "snapshotEligible" in result:
         result["snapshotEligible"] = any(game.get("snapshotEligible", False) for game in result["games"])
     if "odds" in result:
@@ -1328,15 +1331,36 @@ class AnalysisFlight:
 _inflight: dict[str, AnalysisFlight] = {}
 
 
+def cancelled_game(game: dict[str, Any]) -> bool:
+    if game.get("GAME_RESULT_CK") in (True, 1, "1") or str(game.get("GAME_STATE_SC")) == "3":
+        return False
+    return (str(game.get("GAME_STATE_SC")) == "4"
+            or ("취소" in str(game.get("CANCEL_SC_NM", ""))
+                and str(game.get("CANCEL_SC_ID", "0")) not in ("0", "None", "")))
+
+
+def _cancelled_card(game: dict[str, Any]) -> dict[str, Any]:
+    return {"id": game["G_ID"], "time": game.get("G_TM", "—"), "park": game.get("S_NM", "—"),
+            "away": game["AWAY_NM"], "home": game["HOME_NM"],
+            "awayPitcher": (game.get("T_PIT_P_NM") or "").strip() or "미정",
+            "homePitcher": (game.get("B_PIT_P_NM") or "").strip() or "미정",
+            "awayProb": None, "homeProb": None, "pick": "—", "confidence": "예측 보류",
+            "status": "cancelled", "officialStatus": game.get("CANCEL_SC_NM") or "취소 · 사유 미제공",
+            "lineupConfirmed": False, "snapshotEligible": False, "reasons": [],
+            "valueBet": {"available": False, "recommendation": False}}
+
+
 def _analyze_uncached(date: str, refresh_odds: bool = False) -> dict[str, Any]:
-    games = fetch_games(date)
+    scheduled = fetch_games(date)
+    cancelled = [_cancelled_card(game) for game in scheduled if cancelled_game(game)]
+    games = [game for game in scheduled if not cancelled_game(game)]
     calibrator = load_calibrator()
     method_version = calibrator_model_version(calibrator)
     odds_state = odds_provider_status()
     if not games:
         value_status = "not-configured" if not odds_state["configured"] else "no-market"
         result = {
-            "date": date, "games": [], "hitters": {}, "updatedAt": datetime.now(KST).isoformat(timespec="seconds"),
+            "date": date, "games": cancelled, "hitters": {}, "updatedAt": datetime.now(KST).isoformat(timespec="seconds"),
             "source": "KBO 공식 홈페이지", "sources": ["KBO 공식 홈페이지", "Open-Meteo"],
             "methodVersion": method_version, "valueBetStatus": value_status, "odds": odds_state,
             "valueBets": [], "snapshotEligible": False,
@@ -1405,6 +1429,10 @@ def _analyze_uncached(date: str, refresh_odds: bool = False) -> dict[str, Any]:
         hitter_predictions, all_confirmed, hitters_by_game = _hitter_predictions(
             games, lineups, hitter_stats, team_stats, pitcher_stats, pitcher_hands, matchup_hitter_stats, roster_status,
         )
+        for game in game_predictions:
+            lineup = lineups[game["id"]]
+            game["lineups"] = {side: lineup[side] for side in ("away", "home")}
+            game["lineupSource"] = "confirmed" if lineup["confirmed"] else "recent"
         value_available = any(game["valueBet"]["available"] for game in game_predictions)
         if value_available:
             value_status = "connected"
@@ -1415,7 +1443,7 @@ def _analyze_uncached(date: str, refresh_odds: bool = False) -> dict[str, Any]:
         else:
             value_status = "no-market"
         result = {
-            "date": date, "games": game_predictions, "hitters": hitter_predictions,
+            "date": date, "games": sorted(game_predictions + cancelled, key=lambda game: (game["time"], game["id"])), "hitters": hitter_predictions,
             "hittersByGame": hitters_by_game,
             "dataQuality": _data_quality(games, lineups, hitter_stats, pitcher_stats, pitcher_hands,
                                          matchup_hitter_stats, roster_status, weather_by_game),

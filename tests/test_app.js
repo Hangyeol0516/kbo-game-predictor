@@ -18,7 +18,7 @@ function browser(now, { href, storedTeam } = {}) {
   const context = vm.createContext({
     Date: Clock, Intl, AbortController,
     fetch: (url, options) => { requests.push(url); requestOptions.push(options); return new Promise(() => {}); },
-    URL,
+    URL, URLSearchParams,
     localStorage: { getItem: () => storedTeam || null, setItem() {} },
     clearTimeout: id => timers.delete(id),
     setTimeout: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; },
@@ -360,4 +360,102 @@ test("doubleheader hitter selection reads only the selected game's matchup", () 
                     second: { "전체": [{ team: "LG", gameId: "second", probability: 60 }] } } };
   vm.runInContext('state.data = payload; state.hitterGame = "second"', context);
   assert.equal(vm.runInContext('visibleHitters()["전체"][0].probability', context), 60);
+});
+
+test("summary distinguishes missing history, team selection and actual saved changes", () => {
+  const now = { value: Date.parse('2026-10-02T09:00:00Z') };
+  const { context, elements } = browser(now);
+  context.payload = { ...payload(now.value), date:'2026-10-02' };
+  context.payload.games[0].id='one';
+  context.payload.games[0].predictionHistory=[{at:new Date(now.value).toISOString(),homeProb:46,changes:['첫 저장']}];
+  vm.runInContext('state.data=payload;renderDailySummary()',context);
+  assert.match(elements.get('#summaryContent').innerHTML,/최근 변경 0경기/);
+  context.payload.games[0].predictionHistory.push({at:new Date(now.value+60000).toISOString(),homeProb:48,changes:['승률 변경','추천 철회']});
+  vm.runInContext('renderDailySummary()',context);
+  assert.match(elements.get('#summaryContent').innerHTML,/최근 변경 1경기/);
+  assert.match(elements.get('#summaryContent').innerHTML,/추천 철회/);
+  vm.runInContext('state.team="한화";renderDailySummary()',context);
+  assert.match(elements.get('#summaryContent').innerHTML,/한화 경기/);
+  assert.match(elements.get('#summaryContent').innerHTML,/관심 구단의 등록 경기가 없습니다/);
+  context.payload={date:'2026-04-01',viewMode:'historical',games:[]};
+  vm.runInContext('state.data=payload;renderDailySummary()',context);
+  assert.match(elements.get('#summaryContent').innerHTML,/경기 없음으로 판단할 수 없습니다/);
+});
+
+test("detail history separates model segments, preserves withdrawals and escapes evidence", () => {
+  const { context } = browser({value:Date.parse('2026-10-02T09:00:00Z')});
+  context.game={home:'두산',predictionHistory:[
+    {at:'2026-10-02T16:00:00+09:00',homeProb:40,modelVersion:'m1',lineupStatus:'projected',recommended:true,underdog:'두산',odds:2.5},
+    {at:'2026-10-02T17:00:00+09:00',homeProb:45,modelVersion:'m2',lineupStatus:'confirmed',recommended:false,changes:['모델 변경','추천 철회'],reasons:['<script>근거</script>']}]};
+  const markup=vm.runInContext('historyMarkup(game)',context);
+  assert.doesNotMatch(markup,/<line /);
+  assert.match(markup,/추천 철회/);
+  assert.match(markup,/&lt;script&gt;/);
+  assert.match(markup,/<caption>/);
+  context.game.predictionHistory.length=1;
+  assert.match(vm.runInContext('historyMarkup(game)',context),/추세를 판단할 수 없습니다/);
+  context.game.predictionHistory=[];
+  assert.match(vm.runInContext('historyMarkup(game)',context),/저장된 경기 전 예측 이력이 없습니다/);
+});
+
+test("official cancellation and collection failure are not hidden as an empty schedule", () => {
+  const now={value:Date.parse('2026-10-02T09:00:00Z')};
+  const {context,elements}=browser(now);
+  context.payload={...payload(now.value),games:[{id:'rain',away:'LG',home:'두산',status:'cancelled',officialStatus:'우천취소',homeProb:null,awayProb:null,reasons:[]}]};
+  vm.runInContext('state.data=payload;renderAnalysis()',context);
+  assert.match(elements.get('#gameGrid').innerHTML,/우천취소/);
+  assert.doesNotMatch(elements.get('#gameGrid').innerHTML,/null%/);
+  assert.match(elements.get('#summaryContent').innerHTML,/공식 취소 1경기/);
+  vm.runInContext('renderError("공식 일정 수집 실패")',context);
+  assert.match(elements.get('#summaryContent').textContent,/경기 유무를 확인하지 못했습니다/);
+});
+
+test("performance period and team filters travel together and reset pagination", async () => {
+  const {context,elements,requests}=browser({value:Date.parse('2026-10-02T09:00:00Z')});
+  vm.runInContext('["#performanceStart","#performanceEnd"].forEach(selector=>document.querySelector(selector))',context);
+  elements.get('#performanceStart').value='2026-04-01';
+  elements.get('#performanceEnd').value='2026-05-31';
+  elements.get('#performanceTeam').value='LG';
+  vm.runInContext('state.performancePage=3',context);
+  elements.get('#performanceFilters').handlers.submit({preventDefault(){}});
+  const params=new URL(requests.at(-1),'http://localhost').searchParams;
+  assert.equal(params.get('start'),'2026-04-01');assert.equal(params.get('end'),'2026-05-31');assert.equal(params.get('team'),'LG');
+  assert.equal(params.has('page'),false);
+  elements.get('#performanceNext').handlers.click();
+  assert.match(requests.at(-1),/page=2/);
+  elements.get('#performanceReset').handlers.click();
+  assert.equal(requests.at(-1),'/api/performance');
+});
+
+test("a late period response cannot overwrite new filters or pagination", async () => {
+  const {context,elements}=browser({value:Date.parse('2026-10-02T09:00:00Z')});
+  const pending=[];
+  context.fetch=()=>new Promise(resolve=>pending.push(resolve));
+  vm.runInContext('loadPerformance()',context);
+  elements.get('#performanceTeam').value='LG';vm.runInContext('loadPerformance()',context);
+  pending[1]({ok:true,json:async()=>({recent:[],evaluatedGames:3,modelVersion:'new',filters:{team:'LG'},pagination:{page:2,pages:4,total:31},monthly:[]})});
+  await new Promise(resolve=>setImmediate(resolve));
+  pending[0]({ok:true,json:async()=>({recent:[],evaluatedGames:1,modelVersion:'old',filters:{team:'NC'},pagination:{page:1,pages:1,total:1}})});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.match(elements.get('#performanceScope').textContent,/LG/);
+  assert.equal(elements.get('#performancePage').textContent,'2 / 4 · 31경기');
+  assert.doesNotMatch(elements.get('#performanceContent').innerHTML,/>old</);
+});
+
+test("history timestamps are converted to Korea and malformed timestamps stay explicit", () => {
+  const {context}=browser({value:Date.parse('2026-10-02T09:00:00Z')});
+  assert.match(vm.runInContext('formatTimestamp("2026-10-02T16:00:00Z")',context),/2026\. 10\. 03\./);
+  assert.match(vm.runInContext('formatTimestamp("2026-10-02T16:00:00Z")',context),/오전 01:00:00/);
+  assert.equal(vm.runInContext('formatTimestamp(null)',context),'시각 미제공');
+});
+
+test("empty official schedule still shows collector failure and actual retry policy", () => {
+  const {context,elements}=browser({value:Date.parse('2026-10-02T09:00:00Z')});
+  context.payload={date:'2026-10-02',games:[],collectorStatus:{lastError:'results: OSError',enabled:true,intervalSeconds:1200}};
+  vm.runInContext('state.data=payload;renderDailySummary()',context);
+  assert.match(elements.get('#summaryContent').innerHTML,/자동 수집 일부 실패.*20분 간격/);
+  assert.match(elements.get('#summaryContent').innerHTML,/공식 일정 조회에 성공/);
+  context.payload.collectorStatus.enabled=false;
+  vm.runInContext('renderDailySummary()',context);
+  assert.match(elements.get('#summaryContent').innerHTML,/자동 수집이 꺼져/);
 });

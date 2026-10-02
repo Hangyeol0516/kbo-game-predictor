@@ -86,6 +86,11 @@
         KBO 공식 데이터를 불러오는 중입니다.
       </aside>
 
+      <section id="dailySummary" class="daily-summary" aria-labelledby="summary-title">
+        <h2 id="summary-title">선택 날짜 요약</h2>
+        <div id="summaryContent" aria-live="polite">공식 자료를 확인하고 있습니다.</div>
+      </section>
+
       <section id="games" tabindex="-1" class="content-section" aria-labelledby="games-title">
         <div class="section-heading">
           <div>
@@ -117,7 +122,7 @@
           <div>
             <p class="section-kicker">HIT PROBABILITY</p>
             <h2 id="hitters-title">포지션별 안타 후보</h2>
-            <p class="section-description">오늘 출전 예상 선수의 1안타 이상 확률입니다.</p>
+            <p class="section-description">선택 날짜에 제공된 라인업 선수의 1안타 이상 확률입니다.</p>
           </div>
           <div class="ranking-unit">확률 높은 순 <span>TOP 3</span></div>
         </div>
@@ -137,12 +142,23 @@
           </div>
           <div class="ranking-unit">TIME-ORDERED <span>NO LEAKAGE</span></div>
         </div>
-        <label class="performance-filter" for="performanceModel">성능 범위
-          <select id="performanceModel"><option value="current">현재 모델</option><option value="all">전체 모델</option></select>
-        </label>
+        <form id="performanceFilters" class="performance-filter">
+          <label for="performanceModel">모델<select id="performanceModel"><option value="current">현재 모델</option><option value="all">전체 모델</option></select></label>
+          <label for="performanceStart">시작일<input id="performanceStart" type="date" /></label>
+          <label for="performanceEnd">종료일<input id="performanceEnd" type="date" /></label>
+          <label for="performanceTeam">구단<select id="performanceTeam"><option value="all">전체 구단</option></select></label>
+          <button type="submit" id="performanceApply" class="toolbar-button">범위 적용</button>
+          <button type="button" id="performanceReset" class="toolbar-button">필터 초기화</button>
+        </form>
+        <p id="performanceScope" class="performance-scope" role="status"></p>
         <div id="performanceContent" class="performance-content">
           <div class="empty-state"><strong>성능 기록을 확인하고 있습니다.</strong>저장된 예측과 경기 결과를 대조합니다.</div>
         </div>
+        <nav class="performance-pages" aria-label="채점 내역 페이지">
+          <button id="performancePrev" type="button" class="toolbar-button" disabled>이전 내역</button>
+          <span id="performancePage" role="status">1 / 1</span>
+          <button id="performanceNext" type="button" class="toolbar-button" disabled>다음 내역</button>
+        </nav>
       </section>
 
       <section id="method" class="method-section" aria-labelledby="method-title">
@@ -165,6 +181,10 @@
       <p>© 2026 PLAYBALL LAB</p>
     </footer>
 
+    <dialog id="gameDetail" aria-labelledby="detailTitle">
+      <header class="detail-header"><h2 id="detailTitle">경기 상세</h2><button id="detailClose" type="button" class="toolbar-button">닫기</button></header>
+      <div id="detailContent"></div>
+    </dialog>
     <script src="app.js"></script>
   </body>
 </html>
