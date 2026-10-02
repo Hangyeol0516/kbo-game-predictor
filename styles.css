@@ -3,9 +3,9 @@
   --paper: #f2f0e8;
   --panel: #fbfaf4;
   --line: #d8d5ca;
-  --muted: #716f68;
+  --muted: #625f58;
   --green: #31dc78;
-  --green-dark: #167a45;
+  --green-dark: #126738;
   --orange: #ff6b35;
   --yellow: #f4ce48;
   --shadow: 0 18px 55px rgba(7, 19, 15, 0.08);
@@ -280,3 +280,74 @@ footer { min-height: 110px; padding: 25px max(24px, calc((100vw - 1200px) / 2));
   .result-row { grid-template-columns: 1fr auto; }
   .result-row time { grid-column: 1 / -1; }
 }
+
+/* 조회 설정과 키보드·모바일 탐색 */
+[hidden] { display: none !important; }
+button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 3px solid var(--orange); outline-offset: 4px;
+}
+button:disabled { opacity: .5; cursor: wait; }
+.skip-link { position: fixed; left: 16px; top: -100px; z-index: 100; padding: 12px; background: white; border: 2px solid var(--ink); }
+.skip-link:focus { top: 12px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.mobile-nav { display: none; }
+.view-toolbar { max-width: 1152px; margin: 0 auto 20px; display: flex; align-items: center; flex-wrap: wrap; gap: 12px; font-size: 12px; }
+.view-toolbar select, .toolbar-button, .performance-filter select { min-height: 42px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+.toolbar-button { cursor: pointer; font-weight: 700; }
+.auto-refresh { display: flex; align-items: center; gap: 6px; min-height: 42px; }
+.auto-refresh input { width: 18px; height: 18px; accent-color: var(--green-dark); }
+#updateStatus { flex-basis: 100%; color: var(--muted); font-size: 11px; }
+.game-summary { color: var(--muted); font-size: 12px; margin: -12px 0 20px; }
+.game-status { padding: 0 20px 16px; color: var(--green-dark); font-size: 11px; }
+.prediction-timeline { padding-left: 20px; margin-top: 8px; max-height: 240px; overflow: auto; }
+.refresh-error { margin-bottom: 0; color: #8b3a28; }
+.performance-filter { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; font-size: 12px; color: #b5c3bb; }
+.calibration-summary { grid-column: 1 / -1; border: 1px solid #294137; border-radius: 9px; padding: 20px; }
+.calibration-summary h3 { margin-top: 0; font-size: 14px; }
+.calibration-summary p { color: #aab9b1; font-size: 12px; }
+.calibration-summary table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
+.calibration-summary th, .calibration-summary td { padding: 10px; border-bottom: 1px solid #294137; }
+.native-date:focus { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); z-index: 2; opacity: 1; width: 160px; height: 42px; pointer-events: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.section-description, .metric-grid small, .game-meta { overflow-wrap: anywhere; }
+.game-meta { gap: 12px; }
+.game-meta strong { flex-shrink: 0; }
+.value-section .empty-state strong, .performance-section .empty-state strong { color: white; }
+.value-section .empty-state, .performance-section .empty-state { color: #b3c0b8; border-color: #385046; }
+@media (max-width: 800px) {
+  .mobile-nav { display: flex; overflow-x: auto; gap: 4px; background: var(--ink); color: #c4cfc8; padding: 8px 16px; }
+  .mobile-nav a { flex: 1 0 auto; padding: 10px 12px; text-align: center; font-size: 12px; }
+  .view-toolbar { margin-left: 16px; margin-right: 16px; gap: 8px; }
+  .position-button { min-height: 44px; }
+  .date-bar { padding-left: 12px; padding-right: 12px; }
+}
+@media (max-width: 480px) {
+  .today-button { display: block; padding: 8px; }
+  .date-display span { font-size: 14px; }
+  .date-display { min-width: 160px; }
+  .icon-button { width: 36px; min-height: 44px; }
+  .ranking-unit { max-width: 85px; line-height: 1.6; text-align: right; }
+  .runner-card { padding: 14px 12px; gap: 8px; grid-template-columns: 24px minmax(0, 1fr) auto; }
+  .runner-card p { overflow-wrap: anywhere; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+.value-metrics small, .value-metrics span { color: #abb9b1; }
+.performance-section .ranking-unit span { color: var(--green); }
+.result-row time, .result-row span { color: #a0b2a8; }
+
+.hitter-game-filter { max-width: 1200px; margin: 0 auto 16px; display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
+.hitter-game-filter select { max-width: 70%; min-height: 44px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--panel); }
+.value-card.no-bet { opacity: 1; }
+@media (max-width: 480px) {
+  .hitter-feature { min-height: auto; }
+  .probability-ring { position: relative; right: auto; bottom: auto; justify-self: end; margin-top: 20px; }
+}
+@media (min-width: 360px) and (max-width: 480px) {
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-grid article { padding: 16px 12px; }
+}
+
+.runner-card > strong { color: var(--muted); }

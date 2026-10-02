@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""정적 앱과 KBO 분석 API를 함께 제공하는 무의존성 개발 서버."""
+"""정적 앱과 KBO 분석 API를 함께 제공하는 무의존성 단일 컨테이너 서버."""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ COLLECTOR_STATE = {
     "lastRun": None, "lastAnalysis": None, "lastResultSync": None,
     "lastOddsSlot": None, "lastError": None,
 }
-COLLECTOR_ODDS_SLOTS: dict[str, str] = {}
 STATIC_PATHS = {"/", "/index.html", "/app.js", "/styles.css"}
 ANALYSIS_SLOTS = threading.BoundedSemaphore(env_int("PLAYBALL_MAX_CONCURRENT_ANALYSES", 4, 1))
 
@@ -150,15 +149,17 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def _game_start_times(games: list[dict], now: datetime) -> list[datetime]:
+def _game_start_times(games: list[dict], now: datetime, include_started: bool = False) -> list[datetime]:
     starts = []
     for game in games:
         state = game.get("GAME_STATE_SC")
-        if bool(game.get("GAME_RESULT_CK")) or (state is not None and str(state) != "1"):
-            continue
         try:
             hour, minute = map(int, str(game.get("G_TM", "")).strip()[:5].split(":"))
-            starts.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
+            start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            pending = not bool(game.get("GAME_RESULT_CK")) and (state is None or str(state) == "1")
+            started = start <= now and (bool(game.get("GAME_RESULT_CK")) or str(state) == "2")
+            if pending or (include_started and started):
+                starts.append(start)
         except (TypeError, ValueError):
             continue
     return sorted(starts)
@@ -166,7 +167,7 @@ def _game_start_times(games: list[dict], now: datetime) -> list[datetime]:
 
 def collector_odds_slot(games: list[dict], now: datetime) -> str | None:
     """현재 시각까지 도달한 가장 최근 배당 수집 슬롯을 반환한다."""
-    starts = _game_start_times(games, now)
+    starts = _game_start_times(games, now, include_started=True)
     if not starts or now >= starts[0]:
         return None
     slots = (
@@ -179,10 +180,10 @@ def collector_odds_slot(games: list[dict], now: datetime) -> str | None:
 
 
 def collector_analysis_due(games: list[dict], now: datetime) -> bool:
-    """경기가 있는 날 오전 9시부터 첫 경기 시작 전까지만 분석한다."""
+    """오전 9시부터 마지막 미시작 경기의 라인업까지 분석한다."""
     starts = _game_start_times(games, now)
     morning = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    return bool(starts and morning <= now < starts[0])
+    return bool(starts and morning <= now < starts[-1])
 
 
 def background_collector() -> None:
@@ -192,27 +193,28 @@ def background_collector() -> None:
         errors = []
         now = datetime.now(KST)
         today = now.date().isoformat()
+        schedule_ok = False
         try:
             games = fetch_games(today)
+            schedule_ok = True
         except Exception as exc:
             games = []
             errors.append(f"schedule: {type(exc).__name__}")
             print(f"background schedule failed: {exc}", flush=True)
         if collector_analysis_due(games, now):
             odds_slot = collector_odds_slot(games, now)
-            refresh_odds = bool(odds_slot and COLLECTOR_ODDS_SLOTS.get(today) != odds_slot)
             try:
+                refresh_odds = bool(odds_slot and odds_provider_status()["configured"]
+                                    and STORE.claim_odds_slot(today, odds_slot))
                 STORE.save_analysis(analyze(today, force=True, refresh_odds=refresh_odds))
                 if refresh_odds:
-                    COLLECTOR_ODDS_SLOTS.clear()
-                    COLLECTOR_ODDS_SLOTS[today] = odds_slot
                     COLLECTOR_STATE["lastOddsSlot"] = f"{today}:{odds_slot}"
                 COLLECTOR_STATE["lastAnalysis"] = datetime.now(KST).isoformat(timespec="seconds")
             except Exception as exc:
                 errors.append(f"analysis: {type(exc).__name__}")
                 print(f"background analysis failed: {exc}", flush=True)
         try:
-            STORE.sync_results(fetch_games)
+            STORE.sync_results(lambda date: games if schedule_ok and date == today else fetch_games(date))
             COLLECTOR_STATE["lastResultSync"] = datetime.now(KST).isoformat(timespec="seconds")
         except Exception as exc:
             errors.append(f"results: {type(exc).__name__}")

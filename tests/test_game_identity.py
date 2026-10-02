@@ -65,3 +65,15 @@ class GameIdentityTest(unittest.TestCase):
         self.assertEqual(players["2"]["pitcherHand"], "우투")
         self.assertGreater(players["1"]["probability"], players["2"]["probability"])
         self.assertEqual(by_game["2"]["전체"][0]["gameId"], "2")
+
+    def test_game_level_rankings_retain_all_lineup_players_for_team_filters(self):
+        games = self.games()[:1]
+        players = [{"team": "LG", "name": f"선수{i}", "order": i + 1, "position": "중견수"} for i in range(5)]
+        hands = {("1", side): {"split": "RO", "label": "우투"} for side in ("away", "home")}
+        ranked, _, by_game = _hitter_predictions(
+            games, {"1": {"confirmed": True, "away": players, "home": []}}, {},
+            {"LG": {"avg": .28, "era": 4}, "두산": {"avg": .27, "era": 5}}, {}, hands, {}, {},
+        )
+        self.assertEqual(len(ranked["전체"]), 3)
+        self.assertEqual(len(by_game["1"]["전체"]), 5)
+        self.assertEqual(len(by_game["1"]["중견수"]), 5)

@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from collections.abc import Iterator
 
 
 SCHEMA = """
@@ -80,6 +82,25 @@ CREATE TABLE IF NOT EXISTS value_bet_predictions (
 CREATE INDEX IF NOT EXISTS idx_game_predictions_date ON game_predictions(prediction_date);
 CREATE INDEX IF NOT EXISTS idx_game_results_date ON game_results(game_date);
 CREATE INDEX IF NOT EXISTS idx_value_bets_date ON value_bet_predictions(prediction_date);
+
+CREATE TABLE IF NOT EXISTS collector_odds_slots (
+    prediction_date TEXT NOT NULL,
+    slot TEXT NOT NULL CHECK (slot IN ('morning', 'pregame', 'closing')),
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (prediction_date, slot)
+);
+
+CREATE TABLE IF NOT EXISTS prediction_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_date TEXT NOT NULL,
+    game_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    lineup_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    UNIQUE (prediction_date, game_id, model_version, lineup_status, created_at)
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_events_game ON prediction_events(prediction_date, game_id, created_at);
 """
 KST = timezone(timedelta(hours=9))
 
@@ -111,14 +132,28 @@ class PredictionStore:
         prediction_columns = {row[1] for row in connection.execute("PRAGMA table_info(game_predictions)")}
         if "payload_json" not in prediction_columns:
             connection.execute("ALTER TABLE game_predictions ADD COLUMN payload_json TEXT")
-        connection.execute("PRAGMA user_version=3")
+        connection.execute("PRAGMA user_version=4")
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=15)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def claim_odds_slot(self, prediction_date: str, slot: str) -> bool:
+        """호출 전에 슬롯을 영구 예약해 재시작·실패·동시 수집의 중복 비용을 막는다."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO collector_odds_slots VALUES (?, ?, ?)",
+                (prediction_date, slot, datetime.now(KST).isoformat(timespec="seconds")),
+            )
+            return cursor.rowcount == 1
 
     def save_analysis(self, analysis: dict[str, Any]) -> None:
         now = datetime.now(KST)
@@ -142,6 +177,18 @@ class PredictionStore:
             for game in eligible_games
         ) else "projected"
         with self.connect() as connection:
+            existing_events = {
+                (row["game_id"], row["lineup_status"])
+                for row in connection.execute(
+                    """SELECT game_id, lineup_status FROM prediction_events
+                       WHERE prediction_date=? AND model_version=? AND created_at=?""",
+                    (analysis["date"], model_version, created_at),
+                )
+            }
+            if all((game["id"], "confirmed" if game.get(
+                    "lineupConfirmed", analysis.get("lineupStatus") == "confirmed",
+                ) else "projected") in existing_events for game in eligible_games):
+                return  # 같은 캐시 응답은 읽기로 종료해 WAL·자동 증가 ID 쓰기도 피한다.
             connection.execute(
                 """INSERT INTO analysis_snapshots
                    (prediction_date, model_version, lineup_status, created_at, payload_json)
@@ -155,6 +202,13 @@ class PredictionStore:
                 lineup_status = "confirmed" if game.get(
                     "lineupConfirmed", analysis.get("lineupStatus") == "confirmed",
                 ) else "projected"
+                connection.execute(
+                    """INSERT OR IGNORE INTO prediction_events
+                       (prediction_date, game_id, model_version, lineup_status, created_at, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (analysis["date"], game["id"], model_version, lineup_status, created_at,
+                     json.dumps(game, ensure_ascii=False)),
+                )
                 connection.execute(
                     """INSERT INTO game_predictions
                        (prediction_date, game_id, model_version, lineup_status, created_at,
@@ -261,8 +315,26 @@ class PredictionStore:
                                 created_at DESC, id DESC
                      ) AS choice
                      FROM game_predictions p WHERE prediction_date = ?
-                   ) SELECT * FROM ranked WHERE choice = 1 ORDER BY game_id""", (prediction_date,),
+                   ) SELECT p.*, r.away_score, r.home_score, r.winner
+                     FROM ranked p LEFT JOIN game_results r ON r.game_id=p.game_id
+                     WHERE choice = 1 ORDER BY p.game_id""", (prediction_date,),
             ).fetchall()
+            events = connection.execute(
+                """SELECT game_id, created_at, lineup_status, model_version, payload_json
+                   FROM prediction_events WHERE prediction_date=? ORDER BY created_at, id""",
+                (prediction_date,),
+            ).fetchall()
+        timeline = {}
+        for event in events:
+            payload = json.loads(event["payload_json"])
+            value = payload.get("valueBet") or {}
+            timeline.setdefault(event["game_id"], []).append({
+                "at": event["created_at"], "lineupStatus": event["lineup_status"],
+                "modelVersion": event["model_version"], "homeProb": payload.get("homeProb"),
+                "recommended": bool(value.get("recommendation")),
+                "underdog": (value.get("underdog") or {}).get("team"),
+                "odds": (value.get("underdog") or {}).get("odds"),
+            })
         games, hitters, sources, warnings = [], {}, set(), []
         for row in rows:
             payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
@@ -276,6 +348,11 @@ class PredictionStore:
             }
             game.update({"snapshotEligible": False, "predictionAt": row["created_at"],
                          "modelVersion": row["model_version"], "lineupConfirmed": row["lineup_status"] == "confirmed"})
+            game["predictionHistory"] = timeline.get(row["game_id"], [])
+            if row["away_score"] is not None:
+                game["result"] = {"awayScore": row["away_score"], "homeScore": row["home_score"],
+                                  "winner": row["winner"], "correct": None if row["winner"] is None
+                                  else row["predicted_winner"] == row["winner"]}
             games.append(game)
             for position, players in payload.get("hitters", {}).items():
                 hitters.setdefault(position, []).extend(players)
@@ -287,6 +364,8 @@ class PredictionStore:
             "date": prediction_date, "viewMode": "historical",
             "historyStatus": "partial" if any(not row["payload_json"] for row in rows) else "available" if rows else "missing",
             "games": games, "hitters": hitters, "snapshotEligible": False,
+            "hittersByGame": {row["game_id"]: (json.loads(row["payload_json"]).get("hitters", {})
+                              if row["payload_json"] else {}) for row in rows},
             "updatedAt": max((row["created_at"] for row in rows), default=None),
             "source": "저장된 당시 예측", "sources": sorted(sources) or ["저장된 당시 예측"],
             "methodVersion": ", ".join(sorted({row["model_version"] for row in rows})) or "—",
@@ -382,6 +461,23 @@ class PredictionStore:
             (row["home_probability"] - float(row["winner"] == row["home_team"])) ** 2
             for row in decided
         ]
+        count = len(decided)
+        interval = None
+        if count:
+            # Wilson 구간은 작은 표본에서 단순 정규 근사보다 안정적이다.
+            z = 1.959963984540054
+            rate = correct / count
+            denominator = 1 + z * z / count
+            center = (rate + z * z / (2 * count)) / denominator
+            radius = z * (rate * (1 - rate) / count + z * z / (4 * count * count)) ** 0.5 / denominator
+            interval = [round((center - radius) * 100, 1), round((center + radius) * 100, 1)]
+        calibration = []
+        for low, high in ((0, .2), (.2, .4), (.4, .6), (.6, .8), (.8, 1.01)):
+            bucket = [row for row in decided if low <= row["home_probability"] < high]
+            if bucket:
+                calibration.append({"samples": len(bucket),
+                    "predicted": round(sum(row["home_probability"] for row in bucket) / len(bucket) * 100, 1),
+                    "observed": round(sum(row["winner"] == row["home_team"] for row in bucket) / len(bucket) * 100, 1)})
         recent = []
         for row in reversed(rows[-10:]):
             recent.append({
@@ -396,6 +492,9 @@ class PredictionStore:
             "evaluatedGames": len(rows), "decidedGames": len(decided), "correctGames": correct,
             "accuracy": round(correct / len(decided) * 100, 1) if decided else None,
             "brierScore": round(sum(brier_values) / len(brier_values), 4) if brier_values else None,
+            "accuracyInterval95": interval, "calibration": calibration,
+            "baseline": {"coinFlipBrier": .25,
+                         "homeWinAccuracy": round(sum(row["winner"] == row["home_team"] for row in decided) / count * 100, 1) if count else None},
             "recent": recent,
             "modelVersion": model_version or "all",
             "valueBet": self.value_bet_performance(model_version),
@@ -405,20 +504,21 @@ class PredictionStore:
     def value_bet_performance(self, model_version: str | None = None) -> dict[str, Any]:
         query = """
         WITH ranked AS (
-          SELECT v.*,
+          SELECT p.*,
                  ROW_NUMBER() OVER (
-                   PARTITION BY v.game_id
-                   ORDER BY CASE v.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, v.created_at DESC
+                   PARTITION BY p.game_id
+                   ORDER BY CASE p.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, p.created_at DESC, p.id DESC
                  ) AS choice
-          FROM value_bet_predictions v
-          WHERE v.recommended = 1
-            AND (? IS NULL OR v.model_version = ?)
+          FROM game_predictions p
+          WHERE (? IS NULL OR p.model_version = ?)
         )
         SELECT v.prediction_date, v.game_id, v.underdog_team, v.underdog_odds,
                v.expected_return, v.bookmaker, r.winner
-        FROM ranked v
-        JOIN game_results r ON r.game_id = v.game_id
-        WHERE v.choice = 1
+        FROM ranked p
+        JOIN value_bet_predictions v ON v.game_id=p.game_id AND v.prediction_date=p.prediction_date
+          AND v.model_version=p.model_version AND v.lineup_status=p.lineup_status AND v.created_at=p.created_at
+        JOIN game_results r ON r.game_id = p.game_id
+        WHERE p.choice = 1 AND v.recommended = 1 AND v.market_quality_passed = 1 AND v.betting_open = 1
         ORDER BY v.prediction_date, v.game_id
         """
         with self.connect() as connection:
@@ -439,22 +539,24 @@ class PredictionStore:
         """추천 여부와 무관하게 저장된 배당 후보를 경기당 가장 신뢰할 시점으로 평가한다."""
         query = """
         WITH ranked AS (
-          SELECT v.*,
+          SELECT p.*,
                  ROW_NUMBER() OVER (
-                   PARTITION BY v.game_id
-                   ORDER BY CASE v.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, v.created_at DESC
+                   PARTITION BY p.game_id
+                   ORDER BY CASE p.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, p.created_at DESC, p.id DESC
                  ) AS choice
-          FROM value_bet_predictions v
-          WHERE (? IS NULL OR v.model_version = ?)
+          FROM game_predictions p
+          WHERE (? IS NULL OR p.model_version = ?)
         )
         SELECT v.prediction_date, v.game_id, v.model_version, v.lineup_status,
                v.underdog_team, v.underdog_odds, v.model_probability,
                v.market_probability, v.expected_return, v.return_advantage,
                v.bookmaker, v.bookmaker_count, v.market_age_minutes,
                v.market_quality_passed, v.betting_open, v.market_updated_at, v.commence_at, r.winner
-        FROM ranked v
-        JOIN game_results r ON r.game_id = v.game_id
-        WHERE v.choice = 1
+        FROM ranked p
+        JOIN value_bet_predictions v ON v.game_id=p.game_id AND v.prediction_date=p.prediction_date
+          AND v.model_version=p.model_version AND v.lineup_status=p.lineup_status AND v.created_at=p.created_at
+        JOIN game_results r ON r.game_id = p.game_id
+        WHERE p.choice = 1
         ORDER BY v.prediction_date, v.game_id
         """
         with self.connect() as connection:

@@ -4,33 +4,42 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-function browser(now) {
+function browser(now, { href, storedTeam } = {}) {
   const elements = new Map();
   const timers = new Map();
   const requests = [];
+  const requestOptions = [];
+  const documentHandlers = {};
   let timerId = 0;
   class Clock extends Date {
+    constructor(...args) { super(...(args.length ? args : [now.value])); }
     static now() { return now.value; }
   }
   const context = vm.createContext({
-    Date: Clock, Intl,
-    fetch: url => { requests.push(url); return new Promise(() => {}); },
+    Date: Clock, Intl, AbortController,
+    fetch: (url, options) => { requests.push(url); requestOptions.push(options); return new Promise(() => {}); },
+    URL,
+    localStorage: { getItem: () => storedTeam || null, setItem() {} },
     clearTimeout: id => timers.delete(id),
     setTimeout: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; },
     document: {
+      visibilityState: "visible",
+      addEventListener(name, callback) { documentHandlers[name] = callback; },
       querySelector(selector) {
         if (!elements.has(selector)) elements.set(selector, {
-          innerHTML: "", textContent: "", value: "",
+          innerHTML: "", textContent: "", value: "", checked: false,
           handlers: {},
           addEventListener(name, callback) { this.handlers[name] = callback; },
+          insertAdjacentHTML(position, html) { this.innerHTML += html; },
           setAttribute() {}, querySelectorAll: () => [],
         });
         return elements.get(selector);
       },
     },
   });
+  if (href) context.window = { location: { href }, history: { replaceState(a, b, url) { context.window.location.href = String(url); } } };
   vm.runInContext(fs.readFileSync(path.join(__dirname, "../app.js"), "utf8"), context);
-  return { context, elements, timers, requests };
+  return { context, elements, timers, requests, requestOptions, documentHandlers };
 }
 
 function payload(now, { startMinutes = 11, priceAge = 0 } = {}) {
@@ -128,4 +137,110 @@ test("incomplete data warnings are visible and escaped", () => {
   context.payload = { ...payload(now.value), dataQuality: { warnings: ["선발 유형 미확인 <test>"] } };
   vm.runInContext("state.data = payload; renderAnalysis()", context);
   assert.match(elements.get("#dataNotice").innerHTML, /선발 유형 미확인 &lt;test&gt;/);
+});
+
+test("initial date and updated clock use Korea even when the browser runs in UTC", () => {
+  const { context, elements, requests } = browser({ value: Date.parse("2026-10-02T16:00:00Z") });
+  assert.match(requests[0], /date=2026-10-03/);
+  assert.equal(vm.runInContext('formatUpdated("2026-10-02T16:00:00Z")', context), "오전 01:00");
+  elements.get("#todayButton").handlers.click();
+  assert.match(requests.at(-1), /date=2026-10-03/);
+});
+
+test("share links restore date, team and history mode and discard impossible dates", () => {
+  const now = { value: Date.parse("2026-10-02T16:00:00Z") };
+  const valid = browser(now, { href: "http://localhost/?date=2026-09-29&team=LG&mode=historical" });
+  assert.match(valid.requests[0], /date=2026-09-29&mode=historical/);
+  assert.equal(vm.runInContext("state.team", valid.context), "LG");
+  const invalid = browser(now, { href: "http://localhost/?date=2026-02-30&team=unknown&mode=bad" });
+  assert.match(invalid.requests[0], /date=2026-10-03&mode=auto/);
+  assert.equal(vm.runInContext("state.team", invalid.context), "all");
+});
+
+test("team filtering uses game-level hitter lists instead of filtering an already truncated global top three", () => {
+  const now = { value: Date.parse("2026-10-02T09:00:00Z") };
+  const { context, elements } = browser(now);
+  context.payload = { ...payload(now.value), hitters: { "전체": [{ team: "두산", probability: 90 }] },
+    hittersByGame: { one: { "전체": [{ team: "두산", probability: 90 }, { team: "LG", probability: 70 }] } } };
+  context.payload.games[0].id = "one";
+  vm.runInContext('state.data = payload; state.team = "LG"; renderGames()', context);
+  assert.equal(vm.runInContext('visibleHitters()["전체"][0].probability', context), 70);
+  vm.runInContext('state.team = "한화"; renderGames()', context);
+  assert.match(elements.get("#gameGrid").innerHTML, /선택한 구단의 경기가 없습니다/);
+});
+
+test("date changes abort the previous request and a late response cannot replace the current date", async () => {
+  const now = { value: Date.parse("2026-10-02T09:00:00Z") };
+  const { context, requestOptions } = browser(now);
+  const pending = [];
+  context.fetch = url => url.startsWith("/api/performance")
+    ? Promise.resolve({ ok: true, json: async () => ({ recent: [], valueBet: {}, evaluatedGames: 0 }) })
+    : new Promise(resolve => pending.push(resolve));
+  vm.runInContext("changeDate(1)", context);
+  assert.equal(requestOptions[0].signal.aborted, true);
+  vm.runInContext("changeDate(1)", context);
+  pending[1]({ ok: true, json: async () => ({ ...payload(now.value), date: "2026-10-04" }) });
+  await new Promise(resolve => setImmediate(resolve));
+  pending[0]({ ok: true, json: async () => ({ ...payload(now.value), date: "2026-10-03" }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(vm.runInContext("state.data.date", context), "2026-10-04");
+});
+
+test("background refresh failure keeps the previous display and suspends recommendations", async () => {
+  const now = { value: Date.parse("2026-10-02T09:00:00Z") };
+  const { context, elements } = browser(now);
+  context.payload = payload(now.value);
+  vm.runInContext('state.data = payload; state.expanded.add("one"); renderAnalysis()', context);
+  context.fetch = async () => { throw new Error("一時 <error>"); };
+  await vm.runInContext("loadAnalysis({ silent: true })", context);
+  assert.match(elements.get("#gameGrid").innerHTML, /LG 트윈스/);
+  assert.match(elements.get("#dataNotice").innerHTML, /이전 분석을 표시/);
+  assert.match(elements.get("#dataNotice").innerHTML, /&lt;error&gt;/);
+  assert.doesNotMatch(elements.get("#valueContent").innerHTML, /역배 PICK/);
+  assert.match(elements.get("#valueContent").innerHTML, /최신 자료 확인 실패/);
+  assert.equal(vm.runInContext('state.expanded.has("one")', context), true);
+});
+
+test("automatic refresh runs for today's live view and pauses on hidden or historical pages", () => {
+  const { context, elements, timers } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
+  elements.get("#autoRefresh").checked = true;
+  vm.runInContext("scheduleRefresh()", context);
+  assert.equal([...timers.values()][0].delay, 300000);
+  context.document.visibilityState = "hidden";
+  vm.runInContext("scheduleRefresh()", context);
+  assert.equal(timers.size, 0);
+  context.document.visibilityState = "visible";
+  vm.runInContext('state.mode = "historical"; scheduleRefresh()', context);
+  assert.equal(timers.size, 0);
+});
+
+test("clearing the date picker does not request an invalid date", () => {
+  const { elements, requests } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
+  elements.get("#nativeDate").handlers.change({ target: { value: "" } });
+  assert.equal(requests.length, 1);
+});
+
+test("scorecard response races keep the user's latest model selection", async () => {
+  const { context, elements } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
+  const pending = [];
+  context.fetch = () => new Promise(resolve => pending.push(resolve));
+  vm.runInContext("loadPerformance()", context);
+  elements.get("#performanceModel").value = "all";
+  vm.runInContext("loadPerformance()", context);
+  pending[1]({ ok: true, json: async () => ({ modelVersion: "all", recent: [], evaluatedGames: 9 }) });
+  await new Promise(resolve => setImmediate(resolve));
+  pending[0]({ ok: true, json: async () => ({ modelVersion: "old", recent: [], evaluatedGames: 1 }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(elements.get("#performanceContent").innerHTML, /all/);
+  assert.doesNotMatch(elements.get("#performanceContent").innerHTML, />old</);
+});
+
+test("doubleheader hitter selection reads only the selected game's matchup", () => {
+  const { context } = browser({ value: Date.parse("2026-10-02T09:00:00Z") });
+  context.payload = { games: [{ id: "first", away: "LG", home: "두산" }, { id: "second", away: "LG", home: "두산" }],
+    hitters: { "전체": [{ team: "LG", gameId: "first", probability: 90 }] },
+    hittersByGame: { first: { "전체": [{ team: "LG", gameId: "first", probability: 90 }] },
+                    second: { "전체": [{ team: "LG", gameId: "second", probability: 60 }] } } };
+  vm.runInContext('state.data = payload; state.hitterGame = "second"', context);
+  assert.equal(vm.runInContext('visibleHitters()["전체"][0].probability', context), 60);
 });

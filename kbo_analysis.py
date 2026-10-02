@@ -31,7 +31,7 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 BASE_URL = "https://www.koreabaseball.com"
 KST = timezone(timedelta(hours=9))
 USER_AGENT = "PLAYBALL/0.1 (+personal KBO analysis prototype)"
-BASE_MODEL_VERSION = "stats-v6-game-context"
+BASE_MODEL_VERSION = "stats-v7-game-context"
 TEAM_HITTER_1 = f"{BASE_URL}/Record/Team/Hitter/Basic1.aspx"
 TEAM_HITTER_2 = f"{BASE_URL}/Record/Team/Hitter/Basic2.aspx"
 TEAM_PITCHER_1 = f"{BASE_URL}/Record/Team/Pitcher/Basic1.aspx"
@@ -587,7 +587,8 @@ def fetch_pitcher_hand(game: dict[str, Any], side: str) -> dict[str, str]:
     name = game.get(name_key, "").strip()
     raw = _post_json("/ws/Controls.asmx/GetSearchPlayer", {"name": name}) if name else {"now": []}
     candidates = [item for item in raw.get("now", []) if item.get("P_NM") == name and item.get("T_NM") == game[team_key]]
-    pitcher_type = candidates[0].get("P_TYPE", "") if candidates else ""
+    # 같은 팀의 동명이인도 있으므로 검색 순서로 선수를 결정하지 않는다.
+    pitcher_type = candidates[0].get("P_TYPE", "") if len(candidates) == 1 else ""
     if pitcher_type.startswith("좌"):
         split, label = "LO", "좌투"
     elif "언" in pitcher_type:
@@ -632,10 +633,10 @@ def fetch_matchup_hitter_stats(team_splits: dict[str, set[str]]) -> dict[tuple[s
             parser = TableParser(("tData01",))
             parser.feed(current_html)
             records = _record_entries(parser, ("선수명", "팀명", "AVG", "AB", "H"), "유형별 타격 기록")
-            for record in records:
+            if any(record["팀명"] != TEAM_CODES[team_id] for record in records):
+                raise DataContractError("유형별 타격 기록: 팀 필터가 적용되지 않았습니다.")
+            for record in _unambiguous_player_records(records):
                 name, team = record["선수명"].lstrip("* "), record["팀명"]
-                if team != TEAM_CODES[team_id]:
-                    raise DataContractError("유형별 타격 기록: 팀 필터가 적용되지 않았습니다.")
                 ab, hits = _record_number(record, "AB"), _record_number(record, "H")
                 if hits > ab:
                     raise DataContractError("유형별 타격 기록: 안타 수가 타수를 초과합니다.")
@@ -760,10 +761,18 @@ def _fetch_team_filtered_records(url: str, team_ids: list[str], fields: tuple[st
     return records
 
 
+def _unambiguous_player_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
+    """선수 ID가 없는 표에서 동명이인 기록을 합치거나 덮어쓰지 않는다."""
+    counts: dict[tuple[str, str], int] = defaultdict(int)
+    for row in records:
+        counts[(row["팀명"], row["선수명"].lstrip("* "))] += 1
+    return [row for row in records if counts[(row["팀명"], row["선수명"].lstrip("* "))] == 1]
+
+
 def fetch_hitter_stats(team_ids: list[str]) -> dict[tuple[str, str], dict[str, float]]:
     records = _fetch_team_filtered_records(PLAYER_HITTER_1, team_ids, ("선수명", "팀명", "AVG", "G", "PA", "AB", "H", "HR"))
     result = {}
-    for row in records:
+    for row in _unambiguous_player_records(records):
         ab, hits, pa = (_record_number(row, field) for field in ("AB", "H", "PA"))
         if hits > ab or ab > pa:
             raise DataContractError("타자 기록: 안타·타수·타석 수가 맞지 않습니다.")
@@ -777,7 +786,7 @@ def fetch_hitter_stats(team_ids: list[str]) -> dict[tuple[str, str], dict[str, f
 def fetch_pitcher_stats(team_ids: list[str]) -> dict[tuple[str, str], dict[str, float]]:
     records = _fetch_team_filtered_records(PLAYER_PITCHER_1, team_ids, ("선수명", "팀명", "ERA", "G", "W", "L", "IP", "WHIP"))
     result = {}
-    for row in records:
+    for row in _unambiguous_player_records(records):
         if row["IP"] in ("0", "0.0", "0 0/3"):
             continue  # 미등판 투수는 팀 기록으로 보완하고 데이터 상태에 표시한다.
         result[(row["팀명"], row["선수명"].lstrip("* "))] = {
@@ -1023,9 +1032,9 @@ def _game_prediction(
     home_probability = min(max(home_probability, 0.28), 0.72)
     raw_home_probability = home_probability
     home_probability = calibrate_probability(home_probability, calibrator)
-    home_percent = round(home_probability * 100)
-    away_percent = 100 - home_percent
-    pick = home_name if home_percent >= away_percent else away_name
+    home_percent = round(home_probability * 100, 1)
+    away_percent = round(100 - home_percent, 1)
+    pick = home_name if home_probability >= 0.5 else away_name
     margin = abs(home_percent - away_percent)
     confidence = "높음" if margin >= 20 else "보통" if margin >= 10 else "접전"
     if (weather.get("precipitationProbability") or 0) >= 60:
@@ -1048,6 +1057,12 @@ def _game_prediction(
         "homeProbability": round(home_probability, 6),
         "pick": pick, "confidence": confidence,
         "lineupConfirmed": lineup_confirmed,
+        "status": "completed" if bool(game.get("GAME_RESULT_CK")) else
+                  "scheduled" if str(game.get("GAME_STATE_SC")) == "1" else
+                  "in-progress" if str(game.get("GAME_STATE_SC")) == "2" else "unavailable",
+        "result": {"awayScore": int(_record_number({"score": game.get("T_SCORE_CN")}, "score")),
+                   "homeScore": int(_record_number({"score": game.get("B_SCORE_CN")}, "score"))}
+                  if bool(game.get("GAME_RESULT_CK")) else None,
         "snapshotEligible": str(game.get("GAME_STATE_SC")) == "1" and not bool(game.get("GAME_RESULT_CK")),
         "weather": weather, "availability": {"away": away_availability, "home": home_availability},
         "valueBet": value_bet,
@@ -1141,7 +1156,7 @@ def _hitter_predictions(
         by_game[game["G_ID"]] = {position: sorted(
             (player for player in players if position == "전체" or player["position"] == position),
             key=lambda player: player["probability"], reverse=True,
-        )[:3] for position in result}
+        ) for position in result}
     return result, all_confirmed, by_game
 
 
@@ -1210,9 +1225,12 @@ def _analyze_uncached(date: str, refresh_odds: bool = False) -> dict[str, Any]:
             "valueBets": [], "snapshotEligible": False,
         }
     else:
-        team_stats = fetch_team_stats()
         relevant_team_ids = list(dict.fromkeys([code for game in games for code in (game["AWAY_ID"], game["HOME_ID"])]))
-        pitcher_hands = fetch_pitcher_hands(games)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            team_future = executor.submit(fetch_team_stats)
+            hands_future = executor.submit(fetch_pitcher_hands, games)
+            team_stats = team_future.result()
+            pitcher_hands = hands_future.result()
         team_id_by_name = {name: code for code, name in TEAM_CODES.items()}
         team_splits: dict[str, set[str]] = defaultdict(set)
         for game in games:

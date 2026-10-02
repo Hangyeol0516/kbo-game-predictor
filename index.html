@@ -18,6 +18,7 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <a class="skip-link" href="#games">경기 예측으로 바로가기</a>
     <div class="noise" aria-hidden="true"></div>
     <header class="site-header">
       <a class="brand" href="#" aria-label="PLAYBALL 홈">
@@ -33,6 +34,10 @@
       </nav>
       <div id="liveStatus" class="live-badge"><i></i> 공식 데이터 연결</div>
     </header>
+
+    <nav class="mobile-nav" aria-label="모바일 주요 메뉴">
+      <a href="#games">경기 예측</a><a href="#value">역배 EV</a><a href="#hitters">타자</a><a href="#performance">성능</a>
+    </nav>
 
     <main>
       <section class="hero" aria-labelledby="hero-title">
@@ -62,6 +67,15 @@
         <button id="todayButton" class="today-button" type="button">오늘</button>
       </section>
 
+      <section class="view-toolbar" aria-label="조회 설정">
+        <label for="teamFilter">관심 구단</label>
+        <select id="teamFilter"><option value="all">전체 구단</option></select>
+        <button id="refreshButton" class="toolbar-button" type="button">새로 확인</button>
+        <label class="auto-refresh"><input id="autoRefresh" type="checkbox" checked /> 5분마다 확인</label>
+        <button id="exportButton" class="toolbar-button" type="button" disabled>분석 내려받기</button>
+        <span id="updateStatus" role="status" aria-live="polite"></span>
+      </section>
+
       <div id="historyControls" class="position-filters" aria-label="과거 날짜 조회 방식" hidden>
         <button id="historyButton" class="position-button" type="button" aria-pressed="true">저장된 당시 예측</button>
         <button id="reanalysisButton" class="position-button" type="button" aria-pressed="false">현재 기록으로 재분석</button>
@@ -72,7 +86,7 @@
         KBO 공식 데이터를 불러오는 중입니다.
       </aside>
 
-      <section id="games" class="content-section" aria-labelledby="games-title">
+      <section id="games" tabindex="-1" class="content-section" aria-labelledby="games-title">
         <div class="section-heading">
           <div>
             <p class="section-kicker">GAME FORECAST</p>
@@ -80,7 +94,8 @@
           </div>
           <div id="lineupLegend" class="status-legend"><i></i> 라인업 확인 중</div>
         </div>
-        <div id="gameGrid" class="game-grid"></div>
+        <p id="gameSummary" class="game-summary" role="status"></p>
+        <div id="gameGrid" class="game-grid" aria-busy="false"></div>
       </section>
 
       <section id="value" class="content-section value-section" aria-labelledby="value-title">
@@ -106,7 +121,10 @@
           </div>
           <div class="ranking-unit">확률 높은 순 <span>TOP 3</span></div>
         </div>
-        <div id="positionFilters" class="position-filters" role="tablist" aria-label="포지션 선택"></div>
+        <label class="hitter-game-filter" for="hitterGame">타자 분석 경기
+          <select id="hitterGame"><option value="all">전체 경기</option></select>
+        </label>
+        <div id="positionFilters" class="position-filters" role="group" aria-label="포지션 선택"></div>
         <div id="hitterContent" class="hitter-content"></div>
       </section>
 
@@ -119,6 +137,9 @@
           </div>
           <div class="ranking-unit">TIME-ORDERED <span>NO LEAKAGE</span></div>
         </div>
+        <label class="performance-filter" for="performanceModel">성능 범위
+          <select id="performanceModel"><option value="current">현재 모델</option><option value="all">전체 모델</option></select>
+        </label>
         <div id="performanceContent" class="performance-content">
           <div class="empty-state"><strong>성능 기록을 확인하고 있습니다.</strong>저장된 예측과 경기 결과를 대조합니다.</div>
         </div>
