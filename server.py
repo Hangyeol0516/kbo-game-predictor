@@ -54,7 +54,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             odds_status = odds_provider_status()
             status = "degraded" if (
                 COLLECTOR_STATE["lastError"] or database_status == "error"
-                or (odds_status["configured"] and odds_status["lastError"])
+                or (odds_status["configured"] and (odds_status["lastError"] or odds_status.get("persistenceError")))
             ) else "ok"
             return self.send_json({
                 "status": status, "database": database_status,

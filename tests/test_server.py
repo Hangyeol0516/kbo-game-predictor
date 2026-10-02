@@ -81,6 +81,15 @@ class StaticServerSecurityTest(unittest.TestCase):
                 urlopen(f"{self.base_url}/health", timeout=2)
         self.assertEqual(error.exception.code, 503)
 
+    def test_odds_persistence_failure_is_visible_as_degraded_health(self):
+        with patch("server.odds_provider_status", return_value={"configured": True, "lastError": None,
+                                                               "persistenceError": "SaveFailed"}), \
+             patch.dict(server.COLLECTOR_STATE, {"lastError": None}):
+            with urlopen(f"{self.base_url}/health", timeout=2) as response:
+                payload = json.load(response)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["odds"]["persistenceError"], "SaveFailed")
+
     def test_past_date_reads_saved_predictions_without_upstream_requests(self):
         payload = {"date": "2026-04-01", "viewMode": "historical", "games": [], "historyStatus": "missing"}
         with patch.object(server.STORE, "historical_analysis", return_value=payload) as history, patch("server.analyze") as analyze:

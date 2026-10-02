@@ -267,7 +267,7 @@ async function loadPerformance() {
         <time>${escapeHtml(game.date)}</time><div><strong>${escapeHtml(game.away)} ${escapeHtml(game.score)} ${escapeHtml(game.home)}</strong><span>예측 ${escapeHtml(game.pick)} · 승리 ${escapeHtml(game.winner)}</span></div>
         <b class="result-badge ${game.correct === true ? "correct" : game.correct === false ? "wrong" : "tie"}">${game.correct === true ? "적중" : game.correct === false ? "실패" : "무승부"}</b>
       </article>`).join("")}</div>` : `<div class="performance-empty"><strong>첫 채점을 기다리는 중입니다.</strong><p>${escapeHtml(data.message)}</p></div>`;
-    container.innerHTML = `<div class="metric-grid">
+    container.innerHTML = `${data.evaluationStatus ? `<p class="evaluation-note">${escapeHtml(data.evaluationStatus.message)} · ${data.evaluationStatus.decidedGames}경기 / ${data.evaluationStatus.dates}개 경기일</p>` : ""}<div class="metric-grid">
       <article><span>평가 경기</span><strong>${data.evaluatedGames}</strong><small>${escapeHtml(data.modelVersion || "GAMES")}</small></article>
       <article><span>승패 적중률</span><strong>${metric(data.accuracy, "%")}</strong><small>${data.correctGames} / ${data.decidedGames}${data.accuracyInterval95 ? ` · 95% 구간 ${data.accuracyInterval95.join("–")}%` : ""}</small></article>
       <article><span>Brier Score</span><strong>${metric(data.brierScore)}</strong><small>낮을수록 정확 · 50:50 기준 0.25</small></article>

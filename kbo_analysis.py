@@ -22,10 +22,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from http.cookiejar import CookieJar
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+from artifact_io import atomic_write_json
 
 
 BASE_URL = "https://www.koreabaseball.com"
@@ -77,7 +79,9 @@ _odds_cache: dict[str, Any] = {"created": 0.0, "regions": None, "credential": No
 _odds_state: dict[str, Any] = {
     "lastFetch": None, "lastError": None, "creditsRemaining": None,
     "creditsUsed": None, "requestCost": None, "eventCount": 0,
+    "cacheRestored": False, "persistenceError": None,
 }
+_odds_restore_key = None
 
 POSITION_GROUPS = {
     "포수": "포수", "1루수": "1루수", "2루수": "2루수", "3루수": "3루수",
@@ -405,6 +409,10 @@ def _odds_team_name(value: str) -> str | None:
 
 def odds_provider_status() -> dict[str, Any]:
     with _odds_lock:
+        key = os.environ.get("PLAYBALL_ODDS_API_KEY", "").strip()
+        if key:
+            _restore_odds_cache(hashlib.sha256(key.encode()).hexdigest()[:12],
+                                os.environ.get("PLAYBALL_ODDS_REGIONS", "eu"))
         age = time.time() - float(_odds_cache["created"])
         return {
             "configured": bool(os.environ.get("PLAYBALL_ODDS_API_KEY", "").strip()),
@@ -412,6 +420,89 @@ def odds_provider_status() -> dict[str, Any]:
             "cacheAgeSeconds": round(age) if _odds_cache["created"] else None,
             **_odds_state,
         }
+
+
+def _odds_cache_path() -> Path | None:
+    configured = os.environ.get("PLAYBALL_ODDS_CACHE_PATH")
+    if configured == "":
+        return None
+    database = Path(os.environ.get("PLAYBALL_DB_PATH", "data/playball.db")).expanduser().resolve()
+    path = Path(configured).expanduser().resolve() if configured else database.with_name("odds-cache.json")
+    calibration = Path(os.environ.get("PLAYBALL_CALIBRATION_PATH", "data/calibration.json")).expanduser().resolve()
+    if path.suffix != ".json" or path in (database, calibration):
+        raise ValueError("배당 캐시 경로는 DB·보정 파일과 다른 JSON 파일이어야 합니다.")
+    return path
+
+
+def _restore_odds_cache(credential: str, regions: str) -> None:
+    """프로세스/키/리전별 최초 접근에만 복구하며 실패 상태도 보존한다."""
+    global _odds_restore_key
+    try:
+        path = _odds_cache_path()
+    except ValueError:
+        _odds_state["persistenceError"] = "InvalidPath"
+        return
+    identity = (str(path), credential, regions)
+    if _odds_restore_key == identity:
+        return
+    _odds_restore_key = identity
+    if (_odds_cache["created"] and _odds_cache["credential"] == credential
+            and _odds_cache["regions"] == regions):
+        return
+    _odds_cache.update({"created": 0.0, "credential": credential, "regions": regions, "eventsByDate": {}})
+    _odds_state.update({"lastFetch": None, "lastError": None, "creditsRemaining": None,
+                        "creditsUsed": None, "requestCost": None, "eventCount": 0,
+                        "cacheRestored": False, "persistenceError": None})
+    if path is None or not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("formatVersion") != 1 or payload.get("credential") != credential or payload.get("regions") != regions:
+            return
+        state = payload["state"]
+        if not isinstance(state, dict):
+            raise ValueError("배당 상태 형식 오류")
+        _odds_state.update({key: state.get(key) for key in ("lastFetch", "lastError", "creditsRemaining", "creditsUsed", "requestCost")})
+        # 최신 호출 실패는 이전 성공 응답을 복구하지 않는다.
+        if state.get("lastError"):
+            return
+        created = float(payload["created"])
+        if not math.isfinite(created) or not 0 <= time.time() - created <= _env_int("PLAYBALL_ODDS_CACHE_SECONDS", 3600, 1):
+            return
+        events = payload["eventsByDate"]
+        if not isinstance(events, dict) or any(not isinstance(value, dict) for value in events.values()):
+            raise ValueError("배당 응답 형식 오류")
+        for day, markets in events.items():
+            datetime.strptime(day, "%Y-%m-%d")
+            for market in markets.values():
+                teams = market["teams"]
+                if (not isinstance(teams, dict) or len(teams) != 2
+                        or set(teams) != {market["away"], market["home"]}
+                        or not set(teams).issubset(TEAM_CODES.values())
+                        or _parse_timestamp(market["commenceTime"]) is None
+                        or not isinstance(market["bookmakerCount"], int) or market["bookmakerCount"] < 1):
+                    raise ValueError("배당 시장 형식 오류")
+                for metrics in teams.values():
+                    price, probability = float(metrics["price"]), float(metrics["marketProbability"])
+                    if (not math.isfinite(price) or price <= 1 or not math.isfinite(probability)
+                            or not 0 <= probability <= 1 or _parse_timestamp(metrics["lastUpdate"]) is None):
+                        raise ValueError("배당 가격 형식 오류")
+        _odds_cache.update({"created": created, "eventsByDate": events})
+        _odds_state.update({"cacheRestored": True, "eventCount": sum(len(values) for values in events.values())})
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        _odds_state["persistenceError"] = "RestoreFailed"
+
+
+def _persist_odds_cache() -> None:
+    try:
+        path = _odds_cache_path()
+        if path is not None:
+            atomic_write_json(path, {"formatVersion": 1, "credential": _odds_cache["credential"],
+                "regions": _odds_cache["regions"], "created": _odds_cache["created"],
+                "eventsByDate": _odds_cache["eventsByDate"], "state": _odds_state})
+        _odds_state["persistenceError"] = None
+    except (OSError, ValueError):
+        _odds_state["persistenceError"] = "SaveFailed"
 
 
 def _parse_market_odds(raw: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
@@ -436,7 +527,7 @@ def _parse_market_odds(raw: list[dict[str, Any]]) -> dict[str, dict[str, dict[st
             for outcome in market.get("outcomes", []):
                 team = _odds_team_name(outcome.get("name", ""))
                 price = _number(str(outcome.get("price", 0)))
-                if team in fair_samples and price > 1:
+                if team in fair_samples and math.isfinite(price) and price > 1:
                     prices[team] = price
                     if price > best.get(team, {}).get("price", 0):
                         best[team] = {
@@ -476,6 +567,7 @@ def fetch_market_odds(date: str, refresh: bool = False) -> dict[str, dict[str, A
     regions = os.environ.get("PLAYBALL_ODDS_REGIONS", "eu")
     credential = hashlib.sha256(api_key.encode()).hexdigest()[:12]
     with _odds_lock:
+        _restore_odds_cache(credential, regions)
         cache_matches = (
             _odds_cache["regions"] == regions
             and _odds_cache["credential"] == credential
@@ -501,6 +593,10 @@ def fetch_market_odds(date: str, refresh: bool = False) -> dict[str, dict[str, A
             "oddsFormat": "decimal", "dateFormat": "iso",
         })
         try:
+            # 파일 복구가 실패한 최신 호출 이전의 성공 응답을 되살리지 않게 한다.
+            path = _odds_cache_path()
+            if path is not None:
+                path.unlink(missing_ok=True)
             raw, headers = _get_json_response(f"{ODDS_API_URL}?{query}")
             events_by_date = _parse_market_odds(raw)
             now = datetime.now(KST).isoformat(timespec="seconds")
@@ -515,12 +611,16 @@ def fetch_market_odds(date: str, refresh: bool = False) -> dict[str, dict[str, A
                     "creditsUsed": _number(headers.get("x-requests-used", ""), None),
                     "requestCost": _number(headers.get("x-requests-last", ""), None),
                     "eventCount": len(raw),
+                    "cacheRestored": False,
                 })
+                _persist_odds_cache()
         except Exception as exc:
             error_name = f"HTTP {exc.code}" if isinstance(exc, HTTPError) else type(exc).__name__
             with _odds_lock:
-                _odds_cache.update({"created": 0.0, "eventsByDate": {}})
-                _odds_state.update({"lastError": error_name, "lastFetch": datetime.now(KST).isoformat(timespec="seconds")})
+                _odds_cache.update({"created": 0.0, "eventsByDate": {}, "credential": credential, "regions": regions})
+                _odds_state.update({"lastError": error_name, "lastFetch": datetime.now(KST).isoformat(timespec="seconds"),
+                                    "eventCount": 0, "cacheRestored": False})
+                _persist_odds_cache()
                 return {}
         return events_by_date.get(date, {})
 
@@ -801,18 +901,25 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
     return statistics.mean(values), max(statistics.pstdev(values), 0.001)
 
 
+def valid_calibrator(calibrator: Any) -> bool:
+    valid = (isinstance(calibrator, dict) and calibrator.get("enabled") is True
+            and calibrator.get("kind") == "platt" and calibrator.get("baseModelVersion") == BASE_MODEL_VERSION
+            and all(isinstance(calibrator.get(key), (int, float)) and not isinstance(calibrator[key], bool)
+                    and math.isfinite(calibrator[key]) for key in ("slope", "intercept")))
+    if valid:
+        try:
+            json.dumps(calibrator, allow_nan=False)
+        except (ValueError, TypeError):
+            return False
+    return valid
+
+
 def load_calibrator() -> dict[str, Any] | None:
     path = os.environ.get("PLAYBALL_CALIBRATION_PATH", "data/calibration.json")
     try:
         with open(path, encoding="utf-8") as stream:
             calibrator = json.load(stream)
-        if (
-            isinstance(calibrator, dict)
-            and calibrator.get("enabled") and calibrator.get("kind") == "platt"
-            and calibrator.get("baseModelVersion") == BASE_MODEL_VERSION
-            and all(isinstance(calibrator.get(key), (int, float)) and math.isfinite(calibrator[key])
-                    for key in ("slope", "intercept"))
-        ):
+        if valid_calibrator(calibrator):
             return calibrator
     except (OSError, ValueError, TypeError):
         pass
@@ -829,8 +936,16 @@ def calibrate_probability(probability: float, calibrator: dict[str, Any] | None)
     return min(max(calibrated, 0.20), 0.80)
 
 
+def calibrator_model_version(calibrator: dict[str, Any] | None) -> str:
+    if not calibrator:
+        return BASE_MODEL_VERSION
+    encoded = json.dumps(calibrator, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    revision = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"{BASE_MODEL_VERSION}+platt-{revision}"
+
+
 def active_model_version() -> str:
-    return f"{BASE_MODEL_VERSION}+platt-v1" if load_calibrator() else BASE_MODEL_VERSION
+    return calibrator_model_version(load_calibrator())
 
 
 def _availability_context(
@@ -1087,7 +1202,7 @@ def _game_prediction(
             "awayAvailabilityPenalty": round(away_availability["penalty"], 4),
             "homeAvailabilityPenalty": round(home_availability["penalty"], 4),
             "runEnvironmentFactor": round(run_environment, 4),
-            "rawHomeProbability": round(raw_home_probability, 4),
+            "rawHomeProbability": raw_home_probability,
             "calibrated": bool(calibrator),
         },
     }
@@ -1195,6 +1310,7 @@ def _data_quality(games, lineups, hitters, pitchers, hands, matchup, rosters, we
 class CacheEntry:
     created: float
     value: dict[str, Any]
+    model_version: str = ""
 
 
 _cache: OrderedDict[str, CacheEntry] = OrderedDict()
@@ -1206,6 +1322,7 @@ class AnalysisFlight:
     refresh_odds: bool = False
     result: dict[str, Any] | None = None
     error: Exception | None = None
+    model_version: str = ""
 
 
 _inflight: dict[str, AnalysisFlight] = {}
@@ -1214,7 +1331,7 @@ _inflight: dict[str, AnalysisFlight] = {}
 def _analyze_uncached(date: str, refresh_odds: bool = False) -> dict[str, Any]:
     games = fetch_games(date)
     calibrator = load_calibrator()
-    method_version = f"{BASE_MODEL_VERSION}+platt-v1" if calibrator else BASE_MODEL_VERSION
+    method_version = calibrator_model_version(calibrator)
     odds_state = odds_provider_status()
     if not games:
         value_status = "not-configured" if not odds_state["configured"] else "no-market"
@@ -1321,18 +1438,21 @@ def analyze(date: str, force: bool = False, refresh_odds: bool = False) -> dict[
     datetime.strptime(compact_date, "%Y%m%d")
     cache_ttl = _env_int("PLAYBALL_ANALYSIS_CACHE_SECONDS", 600, 30)
     cache_limit = _env_int("PLAYBALL_ANALYSIS_CACHE_ENTRIES", 32, 1)
+    model_version = active_model_version()
     with _cache_lock:
         cached = _cache.get(compact_date)
         flight = _inflight.get(compact_date)
-        if flight is None and cached and not force and not refresh_odds and time.time() - cached.created < cache_ttl:
+        if (flight is None and cached and cached.model_version == model_version and not force
+                and not refresh_odds and time.time() - cached.created < cache_ttl):
             _cache.move_to_end(compact_date)
             return _current_analysis(cached.value)
         owner = flight is None
         if owner:
             flight = AnalysisFlight(threading.Event(), force or refresh_odds, refresh_odds)
+            flight.model_version = model_version
             _inflight[compact_date] = flight
         else:
-            flight.force = flight.force or force or refresh_odds
+            flight.force = flight.force or force or refresh_odds or flight.model_version != model_version
             flight.refresh_odds = flight.refresh_odds or refresh_odds
     if not owner:
         if not flight.event.wait(timeout=180):
@@ -1341,14 +1461,27 @@ def analyze(date: str, force: bool = False, refresh_odds: bool = False) -> dict[
             raise flight.error
         return _current_analysis(flight.result)
     try:
+        model_retries = 0
+        odds_refreshed = False
         while True:
             with _cache_lock:
                 running_force, running_odds = flight.force, flight.refresh_odds
-            result = _analyze_uncached(date, refresh_odds=True) if running_odds else _analyze_uncached(date)
+                running_model = flight.model_version
+            result = (_analyze_uncached(date, refresh_odds=True)
+                      if running_odds and not odds_refreshed else _analyze_uncached(date))
+            odds_refreshed = odds_refreshed or running_odds
+            current_version = active_model_version()
             with _cache_lock:
+                if current_version != running_model or result.get("methodVersion", current_version) != current_version:
+                    model_retries += 1
+                    if model_retries > 3:
+                        raise RuntimeError("분석 중 보정기가 반복 변경됐습니다. 잠시 후 다시 확인해 주세요.")
+                    flight.model_version = current_version
+                    continue
                 if (flight.force and not running_force) or (flight.refresh_odds and not running_odds):
                     continue
-                _cache[compact_date] = CacheEntry(time.time(), result)
+                result_version = result.get("methodVersion", current_version)
+                _cache[compact_date] = CacheEntry(time.time(), result, result_version)
                 _cache.move_to_end(compact_date)
                 while len(_cache) > cache_limit:
                     _cache.popitem(last=False)

@@ -13,6 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kbo_analysis import BASE_MODEL_VERSION, calibrate_probability  # noqa: E402
 from storage import PredictionStore  # noqa: E402
+from artifact_io import atomic_write_json  # noqa: E402
+from scripts.forward_evaluation import raw_probability  # noqa: E402
 
 
 KST = timezone(timedelta(hours=9))
@@ -61,10 +63,14 @@ def main() -> None:
     parser.add_argument("--minimum-games", type=int, default=100)
     parser.add_argument("--minimum-evaluation-games", type=int, default=20)
     args = parser.parse_args()
-    rows = [
-        row for row in PredictionStore(args.db).evaluated_predictions(BASE_MODEL_VERSION)
-        if row["winner"] is not None
-    ]
+    rows = []
+    for row in PredictionStore(args.db).evaluated_predictions(BASE_MODEL_VERSION, include_payload=True, include_calibrated=True):
+        if row["winner"] is None or not (row["model_version"] == BASE_MODEL_VERSION
+                or row["model_version"].startswith(BASE_MODEL_VERSION + "+platt-")):
+            continue
+        probability = raw_probability(row)
+        if probability is not None:
+            rows.append({**row, "home_probability": probability})
     if len(rows) < args.minimum_games:
         raise SystemExit(f"학습 중단: 최소 {args.minimum_games}경기가 필요하지만 현재 {len(rows)}경기입니다.")
     train, validation, test = chronological_split(rows)
@@ -103,7 +109,7 @@ def main() -> None:
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output, payload)
     print(f"보정기 저장: {output} ({baseline_brier:.4f} → {calibrated_brier:.4f})")
 
 

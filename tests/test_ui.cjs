@@ -32,6 +32,7 @@ if (output) fs.mkdirSync(output, { recursive: true });
     hittersByGame:{one:{'전체':players.slice(0,2),'포수':players.slice(0,2)},
       two:{'전체':players.slice(2),'포수':players.slice(2)}},dataQuality:{warnings:[]}};
   const performance={ evaluatedGames:100,decidedGames:100,correctGames:60,accuracy:60,brierScore:.23,modelVersion:'test',
+    evaluationStatus:{message:'표본 부족 · 최소 100경기와 20개 경기일을 기다리고 있습니다.',decidedGames:100,dates:10,sufficientSample:false},
     accuracyInterval95:[50.2,69.1],baseline:{homeWinAccuracy:51},calibration:[{predicted:55,observed:60,samples:100}],
     valueBet:{recommended:10,settled:10,wins:4,roi:8,profitUnits:.8},recent:[{date:today,away:'LG',home:'두산',score:'4 : 2',pick:'LG',winner:'LG',correct:true}] };
   let fail = false;
@@ -65,6 +66,8 @@ if (output) fs.mkdirSync(output, { recursive: true });
     await page.route('**/api/performance*',route=>route.fulfill({contentType:'application/json',body:JSON.stringify(performance)}));
     await page.goto(`${base}/?date=${today}&position=${encodeURIComponent('포수')}`);
     await page.locator('.game-card').first().waitFor();
+    await page.locator('.evaluation-note').waitFor();
+    assert.match(await page.locator('.evaluation-note').textContent(),/표본 부족.*100경기 \/ 10개 경기일/);
     assert.equal(await page.locator('.position-button.active').textContent(),'포수');
     assert.equal(new URL(page.url()).searchParams.get('position'),'포수');
     await page.keyboard.press('Tab');

@@ -25,7 +25,7 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
       - name: Compile Python sources
-        run: python -m compileall -q server.py kbo_analysis.py storage.py scripts tests
+        run: python -m compileall -q server.py kbo_analysis.py storage.py artifact_io.py scripts tests
       - name: Check browser JavaScript
         run: node --check app.js
       - name: Test browser interactions and recommendation expiration
@@ -56,6 +56,9 @@ jobs:
               raise SystemExit("container did not become healthy")
           PY
           docker exec playball-smoke python scripts/backtest.py --help >/dev/null
+          docker exec playball-smoke python scripts/manage_backup.py --help >/dev/null
+          docker exec playball-smoke python scripts/sync_results.py --help >/dev/null
+          docker exec playball-smoke python scripts/forward_evaluation.py --help >/dev/null
           npm install --prefix "$RUNNER_TEMP/playball-ui" --no-save playwright@1.63.0 @axe-core/playwright@4.13.0
           "$RUNNER_TEMP/playball-ui/node_modules/.bin/playwright" install --with-deps chromium
           NODE_PATH="$RUNNER_TEMP/playball-ui/node_modules" \

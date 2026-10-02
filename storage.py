@@ -393,14 +393,21 @@ class PredictionStore:
             lookback_days = max(int(os.environ.get("PLAYBALL_RESULT_LOOKBACK_DAYS", "30")), 1)
         except ValueError:
             lookback_days = 30
+        try:
+            correction_days = max(int(os.environ.get("PLAYBALL_RESULT_CORRECTION_DAYS", "7")), 0)
+        except ValueError:
+            correction_days = 7
         with self.connect() as connection:
             rows = connection.execute(
                 """SELECT DISTINCT p.prediction_date
                    FROM game_predictions p
                    LEFT JOIN game_results r ON r.game_id = p.game_id
-                   WHERE r.game_id IS NULL AND p.prediction_date BETWEEN ? AND ?
+                   WHERE p.prediction_date <= ? AND (
+                       (r.game_id IS NULL AND p.prediction_date >= ?)
+                       OR (r.game_id IS NOT NULL AND ? > 0 AND p.prediction_date >= ?))
                    ORDER BY p.prediction_date""",
-                ((today - timedelta(days=lookback_days)).isoformat(), today.isoformat()),
+                (today.isoformat(), (today - timedelta(days=lookback_days)).isoformat(),
+                 correction_days, (today - timedelta(days=max(correction_days - 1, 0))).isoformat()),
             ).fetchall()
         return [row[0] for row in rows]
 
@@ -409,10 +416,15 @@ class PredictionStore:
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         with self.connect() as connection:
             for game in games:
-                if not bool(game.get("GAME_RESULT_CK")):
+                if game.get("GAME_RESULT_CK") not in (True, 1, "1"):
                     continue
-                away_score = int(game.get("T_SCORE_CN") or 0)
-                home_score = int(game.get("B_SCORE_CN") or 0)
+                scores = []
+                for field in ("T_SCORE_CN", "B_SCORE_CN"):
+                    value = game.get(field)
+                    if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).strip().isdigit():
+                        raise ValueError(f"종료 경기 {game.get('G_ID', '?')}: {field} 점수가 누락되거나 잘못됐습니다.")
+                    scores.append(int(str(value).strip()))
+                away_score, home_score = scores
                 winner = None
                 if away_score > home_score:
                     winner = game["AWAY_NM"]
@@ -424,7 +436,10 @@ class PredictionStore:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(game_id) DO UPDATE SET
                          away_score=excluded.away_score, home_score=excluded.home_score,
-                         winner=excluded.winner, completed_at=excluded.completed_at""",
+                         winner=excluded.winner, completed_at=excluded.completed_at
+                       WHERE game_results.away_score != excluded.away_score
+                         OR game_results.home_score != excluded.home_score
+                         OR game_results.winner IS NOT excluded.winner""",
                     (
                         game["G_ID"], _iso_game_date(game["G_DT"]), game["AWAY_NM"], game["HOME_NM"],
                         away_score, home_score, winner, now,
@@ -452,28 +467,34 @@ class PredictionStore:
             raise ResultSyncError(saved, failed_dates)
         return saved
 
-    def evaluated_predictions(self, model_version: str | None = None) -> list[dict[str, Any]]:
+    def evaluated_predictions(self, model_version: str | None = None, *, include_payload: bool = False,
+                              include_calibrated: bool = False) -> list[dict[str, Any]]:
         query = """
         WITH ranked AS (
           SELECT p.*,
                  ROW_NUMBER() OVER (
                    PARTITION BY p.game_id
-                   ORDER BY CASE p.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, p.created_at DESC
+                   ORDER BY CASE p.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, p.created_at DESC, p.id DESC
                  ) AS choice
           FROM game_predictions p
-          WHERE (? IS NULL OR p.model_version = ?)
+          WHERE (? IS NULL OR p.model_version = ? OR (? AND p.model_version LIKE ?))
         )
         SELECT p.prediction_date, p.game_id, p.model_version, p.lineup_status,
                p.away_team, p.home_team, p.away_probability, p.home_probability,
-               p.predicted_winner, r.away_score, r.home_score, r.winner
+               p.predicted_winner, r.away_score, r.home_score, r.winner, p.payload_json
         FROM ranked p
         JOIN game_results r ON r.game_id = p.game_id
         WHERE p.choice = 1
         ORDER BY p.prediction_date, p.game_id
         """
         with self.connect() as connection:
-            rows = connection.execute(query, (model_version, model_version)).fetchall()
-        return [dict(row) for row in rows]
+            rows = connection.execute(query, (model_version, model_version, include_calibrated,
+                                               f"{model_version}+platt-%")).fetchall()
+        values = [dict(row) for row in rows]
+        if not include_payload:
+            for row in values:
+                row.pop("payload_json", None)
+        return values
 
     def performance_summary(self, model_version: str | None = None) -> dict[str, Any]:
         rows = self.evaluated_predictions(model_version)
@@ -515,6 +536,15 @@ class PredictionStore:
             "accuracy": round(correct / len(decided) * 100, 1) if decided else None,
             "brierScore": round(sum(brier_values) / len(brier_values), 4) if brier_values else None,
             "accuracyInterval95": interval, "calibration": calibration,
+            "evaluationStatus": {
+                "decidedGames": count, "dates": len({row["prediction_date"] for row in decided}),
+                "minimumGames": 100, "minimumDates": 20,
+                "sufficientSample": count >= 100 and len({row["prediction_date"] for row in decided}) >= 20,
+                "dateRange": [decided[0]["prediction_date"], decided[-1]["prediction_date"]] if decided else None,
+                "message": "기간별 성능은 별도 미래 구간에서 검증해야 합니다." if count >= 100
+                           and len({row["prediction_date"] for row in decided}) >= 20
+                           else "표본 부족 · 최소 100경기와 20개 경기일을 기다리고 있습니다.",
+            },
             "baseline": {"coinFlipBrier": .25,
                          "homeWinAccuracy": round(sum(row["winner"] == row["home_team"] for row in decided) / count * 100, 1) if count else None},
             "recent": recent,
@@ -573,7 +603,7 @@ class PredictionStore:
                v.underdog_team, v.underdog_odds, v.model_probability,
                v.market_probability, v.expected_return, v.return_advantage,
                v.bookmaker, v.bookmaker_count, v.market_age_minutes,
-               v.market_quality_passed, v.betting_open, v.market_updated_at, v.commence_at, r.winner
+               v.market_quality_passed, v.betting_open, v.market_updated_at, v.commence_at, v.recommended, r.winner
         FROM ranked p
         JOIN value_bet_predictions v ON v.game_id=p.game_id AND v.prediction_date=p.prediction_date
           AND v.model_version=p.model_version AND v.lineup_status=p.lineup_status AND v.created_at=p.created_at

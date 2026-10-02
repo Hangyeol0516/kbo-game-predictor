@@ -5,11 +5,49 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from kbo_analysis import BASE_MODEL_VERSION, calibrate_probability, load_calibrator
+from kbo_analysis import BASE_MODEL_VERSION, calibrate_probability, load_calibrator, calibrator_model_version, analyze
+import kbo_analysis
+from artifact_io import atomic_write_json
 from scripts.train_calibrator import brier, fit_platt, sigmoid, main, chronological_split
 
 
 class CalibrationTest(unittest.TestCase):
+    def test_different_coefficients_and_training_provenance_have_different_versions(self):
+        first = {"kind": "platt", "slope": 1.0, "intercept": 0.0, "trainedAt": "first"}
+        second = {**first, "slope": 2.0}
+        self.assertNotEqual(calibrator_model_version(first), calibrator_model_version(second))
+        self.assertNotEqual(calibrator_model_version(first), calibrator_model_version({**first, "trainedAt": "second"}))
+        self.assertEqual(calibrator_model_version(first), calibrator_model_version(dict(reversed(list(first.items())))))
+
+    def test_activation_replacement_and_disable_invalidate_cached_analysis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            with patch.dict("kbo_analysis.os.environ", {"PLAYBALL_CALIBRATION_PATH": str(path)}), \
+                 patch.dict(kbo_analysis._cache, {}, clear=True), patch.dict(kbo_analysis._inflight, {}, clear=True), \
+                 patch("kbo_analysis._analyze_uncached", side_effect=lambda _: {
+                     "games": [], "methodVersion": kbo_analysis.active_model_version()}) as compute:
+                self.assertEqual(analyze("2026-10-02")["methodVersion"], BASE_MODEL_VERSION)
+                payload = {"enabled": True, "kind": "platt", "baseModelVersion": BASE_MODEL_VERSION,
+                           "slope": 1.0, "intercept": 0.0}
+                atomic_write_json(path, payload)
+                first = analyze("2026-10-02")["methodVersion"]
+                atomic_write_json(path, {**payload, "slope": 2.0})
+                second = analyze("2026-10-02")["methodVersion"]
+                self.assertNotEqual(first, second)
+                atomic_write_json(path, {**payload, "enabled": False})
+                self.assertEqual(analyze("2026-10-02")["methodVersion"], BASE_MODEL_VERSION)
+                self.assertEqual(compute.call_count, 4)
+
+    def test_atomic_write_failure_preserves_the_previous_calibrator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            atomic_write_json(path, {"previous": True})
+            with patch("artifact_io.os.replace", side_effect=OSError("disk failure")):
+                with self.assertRaises(OSError):
+                    atomic_write_json(path, {"replacement": True})
+            self.assertEqual(json.loads(path.read_text()), {"previous": True})
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
     def test_platt_fit_reduces_overconfidence(self):
         probabilities = [0.8] * 50 + [0.2] * 50
         outcomes = ([1.0] * 30 + [0.0] * 20) + ([1.0] * 20 + [0.0] * 30)
@@ -42,7 +80,11 @@ class CalibrationTest(unittest.TestCase):
             path = Path(directory) / "calibration.json"
             with patch.dict("kbo_analysis.os.environ", {"PLAYBALL_CALIBRATION_PATH": str(path)}):
                 for payload in ([], {"enabled": True, "kind": "platt", "baseModelVersion": BASE_MODEL_VERSION,
-                                     "slope": "invalid", "intercept": 0}):
+                                     "slope": "invalid", "intercept": 0},
+                                {"enabled": True, "kind": "platt", "baseModelVersion": BASE_MODEL_VERSION,
+                                 "slope": True, "intercept": 0},
+                                {"enabled": True, "kind": "platt", "baseModelVersion": BASE_MODEL_VERSION,
+                                 "slope": 1, "intercept": 0, "testBrier": float("inf")}):
                     path.write_text(json.dumps(payload))
                     self.assertIsNone(load_calibrator())
 
@@ -52,6 +94,7 @@ class CalibrationTest(unittest.TestCase):
         rows = train + [{"home_probability": p, "winner": "LG" if y else "두산", "home_team": "LG"}
                         for p, y in validation * 2]
         for index, row in enumerate(rows):
+            row["model_version"] = BASE_MODEL_VERSION
             row["prediction_date"] = (date(2026, 4, 1) + timedelta(days=index // 4)).isoformat()
             row["game_id"] = str(index)
         return rows

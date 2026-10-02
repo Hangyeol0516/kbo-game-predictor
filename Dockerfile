@@ -17,7 +17,7 @@ RUN addgroup -S -g 10001 appuser \
     && adduser -S -D -H -u 10001 -G appuser appuser \
     && install -d -o appuser -g appuser /data
 
-COPY --chown=appuser:appuser server.py kbo_analysis.py storage.py index.html app.js styles.css ./
+COPY --chown=appuser:appuser server.py kbo_analysis.py storage.py artifact_io.py index.html app.js styles.css ./
 COPY --chown=appuser:appuser scripts ./scripts
 
 USER appuser

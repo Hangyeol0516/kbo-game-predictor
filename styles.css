@@ -302,6 +302,7 @@ button:disabled { opacity: .5; cursor: wait; }
 .prediction-timeline { padding-left: 20px; margin-top: 8px; max-height: 240px; overflow: auto; }
 .refresh-error { margin-bottom: 0; color: #8b3a28; }
 .performance-filter { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; font-size: 12px; color: #b5c3bb; }
+.evaluation-note { grid-column: 1 / -1; margin: 0; padding: 14px 16px; border: 1px solid #385046; border-radius: 9px; color: #b5c3bb; font-size: 12px; line-height: 1.7; }
 .calibration-summary { grid-column: 1 / -1; border: 1px solid #294137; border-radius: 9px; padding: 20px; }
 .calibration-summary h3 { margin-top: 0; font-size: 14px; }
 .calibration-summary p { color: #aab9b1; font-size: 12px; }

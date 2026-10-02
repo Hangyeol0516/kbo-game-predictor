@@ -157,6 +157,48 @@ class StorageReliabilityTest(unittest.TestCase):
         self.assertIsNone(summary["baseline"]["homeWinAccuracy"])
         self.assertEqual(summary["calibration"], [])
 
+    def test_incomplete_or_invalid_final_scores_never_leave_a_settled_result(self):
+        self.store.save_analysis(self.analysis())
+        for invalid in (None, "", "-", -1, 2.5, True):
+            with self.subTest(score=invalid), self.assertRaisesRegex(ValueError, "점수가 누락되거나 잘못"):
+                self.store.save_completed_games([{"G_ID": "game", "G_DT": "20261002", "AWAY_NM": "LG",
+                    "HOME_NM": "두산", "T_SCORE_CN": invalid, "B_SCORE_CN": 4, "GAME_RESULT_CK": True}])
+            self.assertEqual(self.store.evaluated_predictions(), [])
+            self.assertEqual(self.store.pending_dates(), ["2026-10-02"])
+        self.result()
+        self.assertEqual(self.store.evaluated_predictions()[0]["winner"], "두산")
+
+    def test_recent_official_correction_updates_scores_and_performance(self):
+        self.store.save_analysis(self.analysis())
+        self.result(4, 2)
+        self.assertEqual(self.store.performance_summary()["accuracy"], 0)
+        self.assertEqual(self.store.pending_dates(), ["2026-10-02"])
+        self.store.sync_results(lambda _: [{"G_ID": "game", "G_DT": "20261002", "AWAY_NM": "LG",
+            "HOME_NM": "두산", "T_SCORE_CN": 2, "B_SCORE_CN": 4, "GAME_RESULT_CK": True}])
+        self.assertEqual(self.store.performance_summary()["accuracy"], 100)
+        with patch.dict("storage.os.environ", {"PLAYBALL_RESULT_CORRECTION_DAYS": "0"}):
+            self.assertEqual(self.store.pending_dates(), [])
+
+    def test_unchanged_corrected_results_do_not_write_again(self):
+        self.result()
+        with self.store.connect() as observer:
+            before = observer.execute("PRAGMA data_version").fetchone()[0]
+            self.result()
+            self.assertEqual(observer.execute("PRAGMA data_version").fetchone()[0], before)
+
+    def test_calibrator_training_family_is_filtered_before_snapshot_selection(self):
+        from kbo_analysis import BASE_MODEL_VERSION
+        older = self.analysis("16", confirmed=True)
+        older["methodVersion"] = "stats-v6-context-value"
+        self.store.save_analysis(older)
+        current = self.analysis("17", confirmed=False)
+        current["methodVersion"] = BASE_MODEL_VERSION + "+platt-new"
+        self.store.save_analysis(current)
+        self.result()
+        rows = self.store.evaluated_predictions(BASE_MODEL_VERSION, include_payload=True, include_calibrated=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model_version"], current["methodVersion"])
+
 
 class AmbiguousPlayerTest(unittest.TestCase):
     def test_same_team_same_name_search_results_do_not_choose_the_first_hand(self):

@@ -16,6 +16,10 @@ from kbo_analysis import (
 
 class ContextValueTest(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict("kbo_analysis.os.environ", {"PLAYBALL_ODDS_CACHE_PATH": ""})
+        environment.start()
+        self.addCleanup(environment.stop)
+        kbo_analysis._odds_restore_key = None
         kbo_analysis._odds_cache.update({"created": 0.0, "regions": None, "credential": None, "eventsByDate": {}})
         kbo_analysis._odds_state.update({
             "lastFetch": None, "lastError": None, "creditsRemaining": None,
