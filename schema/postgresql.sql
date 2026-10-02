@@ -20,6 +20,7 @@ CREATE TABLE game_predictions (
     away_probability NUMERIC(6,5) NOT NULL CHECK (away_probability BETWEEN 0 AND 1),
     home_probability NUMERIC(6,5) NOT NULL CHECK (home_probability BETWEEN 0 AND 1),
     predicted_winner TEXT NOT NULL,
+    payload JSONB,
     UNIQUE (prediction_date, game_id, model_version, lineup_status)
 );
 
@@ -62,3 +63,22 @@ CREATE TABLE value_bet_predictions (
 CREATE INDEX idx_game_predictions_date ON game_predictions(prediction_date);
 CREATE INDEX idx_game_results_date ON game_results(game_date);
 CREATE INDEX idx_value_bets_date ON value_bet_predictions(prediction_date);
+
+CREATE TABLE collector_odds_slots (
+    prediction_date DATE NOT NULL,
+    slot TEXT NOT NULL CHECK (slot IN ('morning', 'pregame', 'closing')),
+    claimed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (prediction_date, slot)
+);
+
+CREATE TABLE prediction_events (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    prediction_date DATE NOT NULL,
+    game_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    lineup_status TEXT NOT NULL CHECK (lineup_status IN ('projected', 'confirmed')),
+    created_at TIMESTAMPTZ NOT NULL,
+    payload JSONB NOT NULL,
+    UNIQUE (prediction_date, game_id, model_version, lineup_status, created_at)
+);
+CREATE INDEX idx_prediction_events_game ON prediction_events(prediction_date, game_id, created_at);

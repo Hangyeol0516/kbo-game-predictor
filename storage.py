@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from collections.abc import Iterator
 
 
 SCHEMA = """
@@ -37,6 +39,7 @@ CREATE TABLE IF NOT EXISTS game_predictions (
     away_probability REAL NOT NULL CHECK (away_probability BETWEEN 0 AND 1),
     home_probability REAL NOT NULL CHECK (home_probability BETWEEN 0 AND 1),
     predicted_winner TEXT NOT NULL,
+    payload_json TEXT,
     UNIQUE (prediction_date, game_id, model_version, lineup_status)
 );
 
@@ -79,8 +82,36 @@ CREATE TABLE IF NOT EXISTS value_bet_predictions (
 CREATE INDEX IF NOT EXISTS idx_game_predictions_date ON game_predictions(prediction_date);
 CREATE INDEX IF NOT EXISTS idx_game_results_date ON game_results(game_date);
 CREATE INDEX IF NOT EXISTS idx_value_bets_date ON value_bet_predictions(prediction_date);
+
+CREATE TABLE IF NOT EXISTS collector_odds_slots (
+    prediction_date TEXT NOT NULL,
+    slot TEXT NOT NULL CHECK (slot IN ('morning', 'pregame', 'closing')),
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (prediction_date, slot)
+);
+
+CREATE TABLE IF NOT EXISTS prediction_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prediction_date TEXT NOT NULL,
+    game_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    lineup_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    UNIQUE (prediction_date, game_id, model_version, lineup_status, created_at)
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_events_game ON prediction_events(prediction_date, game_id, created_at);
 """
 KST = timezone(timedelta(hours=9))
+
+
+class ResultSyncError(RuntimeError):
+    """날짜별 결과 동기화 후 일부 날짜가 실패했음을 알린다."""
+
+    def __init__(self, saved: int, failed_dates: list[str]) -> None:
+        self.saved = saved
+        self.failed_dates = failed_dates
+        super().__init__(f"결과 {saved}건 저장, 실패 날짜: {', '.join(failed_dates)}")
 
 
 class PredictionStore:
@@ -107,24 +138,44 @@ class PredictionStore:
         for name, definition in additions.items():
             if name not in columns:
                 connection.execute(f"ALTER TABLE value_bet_predictions ADD COLUMN {name} {definition}")
-        connection.execute("PRAGMA user_version=2")
+        prediction_columns = {row[1] for row in connection.execute("PRAGMA table_info(game_predictions)")}
+        if "payload_json" not in prediction_columns:
+            connection.execute("ALTER TABLE game_predictions ADD COLUMN payload_json TEXT")
+        connection.execute("PRAGMA user_version=4")
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=15)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def claim_odds_slot(self, prediction_date: str, slot: str) -> bool:
+        """호출 전에 슬롯을 영구 예약해 재시작·실패·동시 수집의 중복 비용을 막는다."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO collector_odds_slots VALUES (?, ?, ?)",
+                (prediction_date, slot, datetime.now(KST).isoformat(timespec="seconds")),
+            )
+            return cursor.rowcount == 1
 
     def save_analysis(self, analysis: dict[str, Any]) -> None:
+        now = datetime.now(KST)
         if (
             not analysis.get("games")
-            or analysis.get("date") != datetime.now(KST).date().isoformat()
+            or analysis.get("viewMode") in ("historical", "reanalysis")
+            or analysis.get("date") != now.date().isoformat()
         ):
             return
         eligible_games = [
             game for game in analysis["games"]
             if game.get("snapshotEligible", analysis.get("snapshotEligible", False))
+            and self._before_start(game, analysis["updatedAt"], now)
         ]
         if not eligible_games:
             return
@@ -135,12 +186,25 @@ class PredictionStore:
             for game in eligible_games
         ) else "projected"
         with self.connect() as connection:
+            existing_events = {
+                (row["game_id"], row["lineup_status"])
+                for row in connection.execute(
+                    """SELECT game_id, lineup_status FROM prediction_events
+                       WHERE prediction_date=? AND model_version=? AND created_at=?""",
+                    (analysis["date"], model_version, created_at),
+                )
+            }
+            if all((game["id"], "confirmed" if game.get(
+                    "lineupConfirmed", analysis.get("lineupStatus") == "confirmed",
+                ) else "projected") in existing_events for game in eligible_games):
+                return  # 같은 캐시 응답은 읽기로 종료해 WAL·자동 증가 ID 쓰기도 피한다.
             connection.execute(
                 """INSERT INTO analysis_snapshots
                    (prediction_date, model_version, lineup_status, created_at, payload_json)
                    VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(prediction_date, model_version, lineup_status) DO UPDATE SET
-                     created_at=excluded.created_at, payload_json=excluded.payload_json""",
+                     created_at=excluded.created_at, payload_json=excluded.payload_json
+                   WHERE excluded.created_at > analysis_snapshots.created_at""",
                 (analysis["date"], model_version, snapshot_lineup_status, created_at, json.dumps(analysis, ensure_ascii=False)),
             )
             for game in eligible_games:
@@ -148,20 +212,37 @@ class PredictionStore:
                     "lineupConfirmed", analysis.get("lineupStatus") == "confirmed",
                 ) else "projected"
                 connection.execute(
+                    """INSERT OR IGNORE INTO prediction_events
+                       (prediction_date, game_id, model_version, lineup_status, created_at, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (analysis["date"], game["id"], model_version, lineup_status, created_at,
+                     json.dumps(game, ensure_ascii=False)),
+                )
+                connection.execute(
                     """INSERT INTO game_predictions
                        (prediction_date, game_id, model_version, lineup_status, created_at,
-                        away_team, home_team, away_probability, home_probability, predicted_winner)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        away_team, home_team, away_probability, home_probability, predicted_winner, payload_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(prediction_date, game_id, model_version, lineup_status) DO UPDATE SET
                          created_at=excluded.created_at,
                          away_probability=excluded.away_probability,
                          home_probability=excluded.home_probability,
-                         predicted_winner=excluded.predicted_winner""",
+                         predicted_winner=excluded.predicted_winner, payload_json=excluded.payload_json
+                       WHERE excluded.created_at > game_predictions.created_at""",
                     (
                         analysis["date"], game["id"], model_version, lineup_status, created_at,
                         game["away"], game["home"],
                         game.get("awayProbability", game["awayProb"] / 100),
                         game.get("homeProbability", game["homeProb"] / 100), game["pick"],
+                        json.dumps({
+                            "game": game,
+                            "hitters": analysis.get("hittersByGame", {}).get(game["id"], {
+                                position: [player for player in players if player.get("gameId") == game["id"]]
+                                for position, players in analysis.get("hitters", {}).items()
+                            }),
+                            "sources": analysis.get("sources", [analysis.get("source", "KBO 공식 홈페이지")]),
+                            "dataQuality": analysis.get("dataQuality", {}),
+                        }, ensure_ascii=False),
                     ),
                 )
                 value = game.get("valueBet") or {}
@@ -201,7 +282,8 @@ class PredictionStore:
                              betting_open=excluded.betting_open,
                              market_updated_at=excluded.market_updated_at,
                              commence_at=excluded.commence_at,
-                             recommended=excluded.recommended""",
+                             recommended=excluded.recommended
+                           WHERE excluded.created_at > value_bet_predictions.created_at""",
                         (
                             analysis["date"], game["id"], model_version, lineup_status, created_at,
                             value["favorite"]["team"], underdog["team"], underdog["odds"],
@@ -216,20 +298,146 @@ class PredictionStore:
                         ),
                     )
 
+    @staticmethod
+    def _before_start(game: dict[str, Any], created_at: str, now: datetime) -> bool:
+        # 구버전 스냅샷은 startsAt 없이 저장되므로 기존 데이터 계약을 유지한다.
+        if "startsAt" not in game:
+            return True
+        try:
+            starts_at = datetime.fromisoformat(game["startsAt"])
+            generated_at = datetime.fromisoformat(created_at)
+            return (
+                starts_at.tzinfo is not None and generated_at.tzinfo is not None
+                and generated_at < starts_at and now < starts_at
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def historical_analysis(self, prediction_date: str) -> dict[str, Any]:
+        """경기마다 당시 저장한 예측을 조회한다. 현재 시즌 기록으로 복원하지 않는다."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """WITH ranked AS (
+                     SELECT p.*, ROW_NUMBER() OVER (
+                       PARTITION BY game_id
+                       ORDER BY CASE lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END,
+                                created_at DESC, id DESC
+                     ) AS choice
+                     FROM game_predictions p WHERE prediction_date = ?
+                   ) SELECT p.*, r.away_score, r.home_score, r.winner
+                     FROM ranked p LEFT JOIN game_results r ON r.game_id=p.game_id
+                     WHERE choice = 1 ORDER BY p.game_id""", (prediction_date,),
+            ).fetchall()
+        timeline = self.prediction_history(prediction_date)
+        games, hitters, sources, warnings = [], {}, set(), []
+        for row in rows:
+            payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+            game = payload.get("game") or {
+                "id": row["game_id"], "away": row["away_team"], "home": row["home_team"],
+                "time": "—", "park": "기록 없음", "awayPitcher": "기록 없음", "homePitcher": "기록 없음",
+                "awayProb": round(row["away_probability"] * 100),
+                "homeProb": round(row["home_probability"] * 100), "pick": row["predicted_winner"],
+                "confidence": "저장된 승률", "reasons": ["이전 저장 형식에는 상세 근거가 없습니다."],
+                "valueBet": {"available": False, "recommendation": False},
+            }
+            game.update({"snapshotEligible": False, "predictionAt": row["created_at"],
+                         "modelVersion": row["model_version"], "lineupConfirmed": row["lineup_status"] == "confirmed"})
+            game["predictionHistory"] = timeline.get(row["game_id"], [])
+            if row["away_score"] is not None:
+                game["result"] = {"awayScore": row["away_score"], "homeScore": row["home_score"],
+                                  "winner": row["winner"], "correct": None if row["winner"] is None
+                                  else row["predicted_winner"] == row["winner"]}
+            games.append(game)
+            for position, players in payload.get("hitters", {}).items():
+                hitters.setdefault(position, []).extend(players)
+            sources.update(payload.get("sources", ["KBO 공식 홈페이지"]))
+            warnings.extend(payload.get("dataQuality", {}).get("warnings", []))
+        for position, players in hitters.items():
+            hitters[position] = sorted(players, key=lambda player: player["probability"], reverse=True)[:3]
+        return {
+            "date": prediction_date, "viewMode": "historical",
+            "historyStatus": "partial" if any(not row["payload_json"] for row in rows) else "available" if rows else "missing",
+            "games": games, "hitters": hitters, "snapshotEligible": False,
+            "hittersByGame": {row["game_id"]: (json.loads(row["payload_json"]).get("hitters", {})
+                              if row["payload_json"] else {}) for row in rows},
+            "updatedAt": max((row["created_at"] for row in rows), default=None),
+            "source": "저장된 당시 예측", "sources": sorted(sources) or ["저장된 당시 예측"],
+            "methodVersion": ", ".join(sorted({row["model_version"] for row in rows})) or "—",
+            "lineupStatus": "confirmed" if rows and all(row["lineup_status"] == "confirmed" for row in rows) else "projected",
+            "valueBetStatus": "historical", "valueBets": [
+                game["valueBet"] | {"gameId": game["id"], "away": game["away"], "home": game["home"], "historical": True}
+                for game in games if (game.get("valueBet") or {}).get("recommendation")
+            ],
+            "dataQuality": {"warnings": list(dict.fromkeys(warnings))},
+            "message": None if rows else "이 날짜에 저장된 경기 전 예측이 없습니다. 현재 기록을 사용한 재분석은 별도로 선택할 수 있습니다.",
+        }
+
+    def prediction_history(self, prediction_date: str) -> dict[str, list[dict[str, Any]]]:
+        """현재/과거 화면 모두 경기 전에 저장된 이벤트만 조회한다."""
+        with self.connect() as connection:
+            events = connection.execute(
+                """SELECT game_id, created_at, lineup_status, model_version, payload_json
+                   FROM prediction_events WHERE prediction_date=? ORDER BY created_at, id""",
+                (prediction_date,),
+            ).fetchall()
+        timeline = {}
+        previous_payloads = {}
+        for event in events:
+            payload = json.loads(event["payload_json"])
+            value = payload.get("valueBet") or {}
+            history = timeline.setdefault(event["game_id"], [])
+            changes = []
+            previous = history[-1] if history else None
+            if previous:
+                if previous["modelVersion"] != event["model_version"]:
+                    changes.append("모델 변경")
+                if previous["lineupStatus"] != event["lineup_status"]:
+                    changes.append("라인업 상태 변경")
+                old_lineup = previous_payloads[event["game_id"]].get("lineups")
+                if old_lineup is not None and payload.get("lineups") is not None and old_lineup != payload["lineups"]:
+                    changes.append("라인업 명단 변경")
+                if previous["starters"] != [payload.get("awayPitcher"), payload.get("homePitcher")]:
+                    changes.append("예고 선발 변경")
+                if previous["recommended"] and not value.get("recommendation"):
+                    changes.append("추천 철회")
+                elif not previous["recommended"] and value.get("recommendation"):
+                    changes.append("추천 시작")
+                if previous["homeProb"] != payload.get("homeProb"):
+                    changes.append("승률 변경")
+            history.append({
+                "at": event["created_at"], "lineupStatus": event["lineup_status"],
+                "modelVersion": event["model_version"], "homeProb": payload.get("homeProb"),
+                "recommended": bool(value.get("recommendation")),
+                "underdog": (value.get("underdog") or {}).get("team"),
+                "odds": (value.get("underdog") or {}).get("odds"),
+                "starters": [payload.get("awayPitcher"), payload.get("homePitcher")],
+                "changes": changes or (["첫 저장"] if not previous else ["정기 확인 · 주요 항목 동일"]),
+                "reasons": payload.get("reasons") or [],
+            })
+            previous_payloads[event["game_id"]] = payload
+        return timeline
+
     def pending_dates(self) -> list[str]:
         today = datetime.now(KST).date()
         try:
             lookback_days = max(int(os.environ.get("PLAYBALL_RESULT_LOOKBACK_DAYS", "30")), 1)
         except ValueError:
             lookback_days = 30
+        try:
+            correction_days = max(int(os.environ.get("PLAYBALL_RESULT_CORRECTION_DAYS", "7")), 0)
+        except ValueError:
+            correction_days = 7
         with self.connect() as connection:
             rows = connection.execute(
                 """SELECT DISTINCT p.prediction_date
                    FROM game_predictions p
                    LEFT JOIN game_results r ON r.game_id = p.game_id
-                   WHERE r.game_id IS NULL AND p.prediction_date BETWEEN ? AND ?
+                   WHERE p.prediction_date <= ? AND (
+                       (r.game_id IS NULL AND p.prediction_date >= ?)
+                       OR (r.game_id IS NOT NULL AND ? > 0 AND p.prediction_date >= ?))
                    ORDER BY p.prediction_date""",
-                ((today - timedelta(days=lookback_days)).isoformat(), today.isoformat()),
+                (today.isoformat(), (today - timedelta(days=lookback_days)).isoformat(),
+                 correction_days, (today - timedelta(days=max(correction_days - 1, 0))).isoformat()),
             ).fetchall()
         return [row[0] for row in rows]
 
@@ -238,10 +446,15 @@ class PredictionStore:
         now = datetime.now().astimezone().isoformat(timespec="seconds")
         with self.connect() as connection:
             for game in games:
-                if not bool(game.get("GAME_RESULT_CK")):
+                if game.get("GAME_RESULT_CK") not in (True, 1, "1"):
                     continue
-                away_score = int(game.get("T_SCORE_CN") or 0)
-                home_score = int(game.get("B_SCORE_CN") or 0)
+                scores = []
+                for field in ("T_SCORE_CN", "B_SCORE_CN"):
+                    value = game.get(field)
+                    if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).strip().isdigit():
+                        raise ValueError(f"종료 경기 {game.get('G_ID', '?')}: {field} 점수가 누락되거나 잘못됐습니다.")
+                    scores.append(int(str(value).strip()))
+                away_score, home_score = scores
                 winner = None
                 if away_score > home_score:
                     winner = game["AWAY_NM"]
@@ -253,7 +466,10 @@ class PredictionStore:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(game_id) DO UPDATE SET
                          away_score=excluded.away_score, home_score=excluded.home_score,
-                         winner=excluded.winner, completed_at=excluded.completed_at""",
+                         winner=excluded.winner, completed_at=excluded.completed_at
+                       WHERE game_results.away_score != excluded.away_score
+                         OR game_results.home_score != excluded.home_score
+                         OR game_results.winner IS NOT excluded.winner""",
                     (
                         game["G_ID"], _iso_game_date(game["G_DT"]), game["AWAY_NM"], game["HOME_NM"],
                         away_score, home_score, winner, now,
@@ -262,45 +478,93 @@ class PredictionStore:
                 saved += 1
         return saved
 
-    def sync_results(self, game_fetcher: Callable[[str], list[dict[str, Any]]]) -> int:
+    def sync_results(
+        self,
+        game_fetcher: Callable[[str], list[dict[str, Any]]],
+        on_error: Callable[[str, Exception], None] | None = None,
+    ) -> int:
+        """각 날짜를 독립적으로 동기화하고, 실패는 선택 콜백으로 알린다."""
         saved = 0
+        failed_dates = []
         for prediction_date in self.pending_dates():
-            saved += self.save_completed_games(game_fetcher(prediction_date))
+            try:
+                saved += self.save_completed_games(game_fetcher(prediction_date))
+            except Exception as exc:
+                failed_dates.append(prediction_date)
+                if on_error is not None:
+                    on_error(prediction_date, exc)
+        if failed_dates and on_error is None:
+            raise ResultSyncError(saved, failed_dates)
         return saved
 
-    def evaluated_predictions(self, model_version: str | None = None) -> list[dict[str, Any]]:
+    def evaluated_predictions(self, model_version: str | None = None, *, include_payload: bool = False,
+                              include_calibrated: bool = False, start: str | None = None,
+                              end: str | None = None, team: str | None = None,
+                              _connection: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
         query = """
         WITH ranked AS (
           SELECT p.*,
                  ROW_NUMBER() OVER (
                    PARTITION BY p.game_id
-                   ORDER BY CASE p.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, p.created_at DESC
+                   ORDER BY CASE p.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, p.created_at DESC, p.id DESC
                  ) AS choice
           FROM game_predictions p
-          WHERE (? IS NULL OR p.model_version = ?)
+          WHERE (? IS NULL OR p.model_version = ? OR (? AND p.model_version LIKE ?))
+            AND (? IS NULL OR p.prediction_date >= ?) AND (? IS NULL OR p.prediction_date <= ?)
+            AND (? IS NULL OR p.away_team = ? OR p.home_team = ?)
         )
         SELECT p.prediction_date, p.game_id, p.model_version, p.lineup_status,
                p.away_team, p.home_team, p.away_probability, p.home_probability,
-               p.predicted_winner, r.away_score, r.home_score, r.winner
+               p.predicted_winner, r.away_score, r.home_score, r.winner, p.payload_json
         FROM ranked p
         JOIN game_results r ON r.game_id = p.game_id
         WHERE p.choice = 1
         ORDER BY p.prediction_date, p.game_id
         """
-        with self.connect() as connection:
-            rows = connection.execute(query, (model_version, model_version)).fetchall()
-        return [dict(row) for row in rows]
+        with (self.connect() if _connection is None else nullcontext(_connection)) as connection:
+            rows = connection.execute(query, (model_version, model_version, include_calibrated,
+                                               f"{model_version}+platt-%", start, start, end, end,
+                                               team, team, team)).fetchall()
+        values = [dict(row) for row in rows]
+        if not include_payload:
+            for row in values:
+                row.pop("payload_json", None)
+        return values
 
-    def performance_summary(self, model_version: str | None = None) -> dict[str, Any]:
-        rows = self.evaluated_predictions(model_version)
+    def performance_summary(self, model_version: str | None = None, *, start: str | None = None,
+                            end: str | None = None, team: str | None = None,
+                            page: int = 1, page_size: int = 10) -> dict[str, Any]:
+        with self.connect() as connection:
+            connection.execute("BEGIN")  # 지표와 ROI를 같은 읽기 시점으로 맞춘다.
+            rows = self.evaluated_predictions(model_version, start=start, end=end, team=team, _connection=connection)
+            candidates = self.evaluated_value_candidates(model_version, start=start, end=end, team=team, _connection=connection)
+        pages = max(1, (len(rows) + page_size - 1) // page_size)
+        page = min(max(page, 1), pages)
         decided = [row for row in rows if row["winner"] is not None]
         correct = sum(row["predicted_winner"] == row["winner"] for row in decided)
         brier_values = [
             (row["home_probability"] - float(row["winner"] == row["home_team"])) ** 2
             for row in decided
         ]
+        count = len(decided)
+        interval = None
+        if count:
+            # Wilson 구간은 작은 표본에서 단순 정규 근사보다 안정적이다.
+            z = 1.959963984540054
+            rate = correct / count
+            denominator = 1 + z * z / count
+            center = (rate + z * z / (2 * count)) / denominator
+            radius = z * (rate * (1 - rate) / count + z * z / (4 * count * count)) ** 0.5 / denominator
+            interval = [round((center - radius) * 100, 1), round((center + radius) * 100, 1)]
+        calibration = []
+        for low, high in ((0, .2), (.2, .4), (.4, .6), (.6, .8), (.8, 1.01)):
+            bucket = [row for row in decided if low <= row["home_probability"] < high]
+            if bucket:
+                calibration.append({"samples": len(bucket),
+                    "predicted": round(sum(row["home_probability"] for row in bucket) / len(bucket) * 100, 1),
+                    "observed": round(sum(row["winner"] == row["home_team"] for row in bucket) / len(bucket) * 100, 1)})
         recent = []
-        for row in reversed(rows[-10:]):
+        for row in list(reversed(rows))[(page - 1) * page_size:page * page_size]:
             recent.append({
                 "date": row["prediction_date"], "away": row["away_team"], "home": row["home_team"],
                 "score": f"{row['away_score']} : {row['home_score']}", "pick": row["predicted_winner"],
@@ -308,38 +572,50 @@ class PredictionStore:
                 "correct": None if row["winner"] is None else row["predicted_winner"] == row["winner"],
                 "homeProbability": round(row["home_probability"] * 100),
                 "lineupStatus": row["lineup_status"],
+                "gameId": row["game_id"], "modelVersion": row["model_version"],
             })
+        monthly = []
+        for month in sorted({row["prediction_date"][:7] for row in rows}):
+            sample = [row for row in rows if row["prediction_date"].startswith(month) and row["winner"] is not None]
+            monthly.append({"month": month, "decidedGames": len(sample),
+                "dates": len({row["prediction_date"] for row in sample}),
+                "accuracy": round(sum(row["predicted_winner"] == row["winner"] for row in sample) / len(sample) * 100, 1) if sample else None,
+                "brierScore": round(sum((row["home_probability"] - float(row["winner"] == row["home_team"])) ** 2 for row in sample) / len(sample), 4) if sample else None})
         return {
             "evaluatedGames": len(rows), "decidedGames": len(decided), "correctGames": correct,
             "accuracy": round(correct / len(decided) * 100, 1) if decided else None,
             "brierScore": round(sum(brier_values) / len(brier_values), 4) if brier_values else None,
+            "accuracyInterval95": interval, "calibration": calibration,
+            "evaluationStatus": {
+                "decidedGames": count, "dates": len({row["prediction_date"] for row in decided}),
+                "minimumGames": 100, "minimumDates": 20,
+                "sufficientSample": count >= 100 and len({row["prediction_date"] for row in decided}) >= 20,
+                "dateRange": [decided[0]["prediction_date"], decided[-1]["prediction_date"]] if decided else None,
+                "message": "기간별 성능은 별도 미래 구간에서 검증해야 합니다." if count >= 100
+                           and len({row["prediction_date"] for row in decided}) >= 20
+                           else "표본 부족 · 최소 100경기와 20개 경기일을 기다리고 있습니다.",
+            },
+            "baseline": {"coinFlipBrier": .25,
+                         "homeWinAccuracy": round(sum(row["winner"] == row["home_team"] for row in decided) / count * 100, 1) if count else None},
             "recent": recent,
+            "monthly": monthly,
+            "filters": {"start": start, "end": end, "team": team},
+            "pagination": {"page": page, "pageSize": page_size, "pages": pages, "total": len(rows)},
+            "modelBreakdown": [{"modelVersion": version, "evaluatedGames": sum(row["model_version"] == version for row in rows)}
+                               for version in sorted({row["model_version"] for row in rows})],
             "modelVersion": model_version or "all",
-            "valueBet": self.value_bet_performance(model_version),
+            "valueBet": self._value_bet_summary(candidates),
             "message": None if rows else "저장된 예측의 경기가 종료되면 성능 지표가 표시됩니다.",
         }
 
-    def value_bet_performance(self, model_version: str | None = None) -> dict[str, Any]:
-        query = """
-        WITH ranked AS (
-          SELECT v.*,
-                 ROW_NUMBER() OVER (
-                   PARTITION BY v.game_id
-                   ORDER BY CASE v.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, v.created_at DESC
-                 ) AS choice
-          FROM value_bet_predictions v
-          WHERE v.recommended = 1
-            AND (? IS NULL OR v.model_version = ?)
-        )
-        SELECT v.prediction_date, v.game_id, v.underdog_team, v.underdog_odds,
-               v.expected_return, v.bookmaker, r.winner
-        FROM ranked v
-        JOIN game_results r ON r.game_id = v.game_id
-        WHERE v.choice = 1
-        ORDER BY v.prediction_date, v.game_id
-        """
-        with self.connect() as connection:
-            rows = connection.execute(query, (model_version, model_version)).fetchall()
+    def value_bet_performance(self, model_version: str | None = None, *, start: str | None = None,
+                              end: str | None = None, team: str | None = None) -> dict[str, Any]:
+        return self._value_bet_summary(self.evaluated_value_candidates(model_version, start=start, end=end, team=team))
+
+    @staticmethod
+    def _value_bet_summary(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        rows = [row for row in candidates
+                if row["recommended"] and row["market_quality_passed"] and row["betting_open"]]
         settled = [row for row in rows if row["winner"] is not None]
         profit = sum(
             row["underdog_odds"] - 1 if row["winner"] == row["underdog_team"] else -1
@@ -352,30 +628,37 @@ class PredictionStore:
             "roi": round(profit / len(settled) * 100, 1) if settled else None,
         }
 
-    def evaluated_value_candidates(self, model_version: str | None = None) -> list[dict[str, Any]]:
+    def evaluated_value_candidates(self, model_version: str | None = None, *, start: str | None = None,
+                                   end: str | None = None, team: str | None = None,
+                                   _connection: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
         """추천 여부와 무관하게 저장된 배당 후보를 경기당 가장 신뢰할 시점으로 평가한다."""
         query = """
         WITH ranked AS (
-          SELECT v.*,
+          SELECT p.*,
                  ROW_NUMBER() OVER (
-                   PARTITION BY v.game_id
-                   ORDER BY CASE v.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, v.created_at DESC
+                   PARTITION BY p.game_id
+                   ORDER BY CASE p.lineup_status WHEN 'confirmed' THEN 0 ELSE 1 END, p.created_at DESC, p.id DESC
                  ) AS choice
-          FROM value_bet_predictions v
-          WHERE (? IS NULL OR v.model_version = ?)
+          FROM game_predictions p
+          WHERE (? IS NULL OR p.model_version = ?)
+            AND (? IS NULL OR p.prediction_date >= ?) AND (? IS NULL OR p.prediction_date <= ?)
+            AND (? IS NULL OR p.away_team = ? OR p.home_team = ?)
         )
         SELECT v.prediction_date, v.game_id, v.model_version, v.lineup_status,
                v.underdog_team, v.underdog_odds, v.model_probability,
                v.market_probability, v.expected_return, v.return_advantage,
                v.bookmaker, v.bookmaker_count, v.market_age_minutes,
-               v.market_quality_passed, v.betting_open, v.market_updated_at, v.commence_at, r.winner
-        FROM ranked v
-        JOIN game_results r ON r.game_id = v.game_id
-        WHERE v.choice = 1
+               v.market_quality_passed, v.betting_open, v.market_updated_at, v.commence_at, v.recommended, r.winner
+        FROM ranked p
+        JOIN value_bet_predictions v ON v.game_id=p.game_id AND v.prediction_date=p.prediction_date
+          AND v.model_version=p.model_version AND v.lineup_status=p.lineup_status AND v.created_at=p.created_at
+        JOIN game_results r ON r.game_id = p.game_id
+        WHERE p.choice = 1
         ORDER BY v.prediction_date, v.game_id
         """
-        with self.connect() as connection:
-            rows = connection.execute(query, (model_version, model_version)).fetchall()
+        with (self.connect() if _connection is None else nullcontext(_connection)) as connection:
+            rows = connection.execute(query, (model_version, model_version, start, start, end, end,
+                                               team, team, team)).fetchall()
         return [dict(row) for row in rows]
 
 

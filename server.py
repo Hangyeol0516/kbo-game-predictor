@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""정적 앱과 KBO 분석 API를 함께 제공하는 무의존성 개발 서버."""
+"""정적 앱과 KBO 분석 API를 함께 제공하는 무의존성 단일 컨테이너 서버."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from kbo_analysis import active_model_version, analyze, fetch_games, odds_provider_status
+from kbo_analysis import TEAM_CODES, DataContractError, active_model_version, analyze, cancelled_game, fetch_games, odds_provider_status
 from storage import PredictionStore
 
 
@@ -31,7 +31,6 @@ COLLECTOR_STATE = {
     "lastRun": None, "lastAnalysis": None, "lastResultSync": None,
     "lastOddsSlot": None, "lastError": None,
 }
-COLLECTOR_ODDS_SLOTS: dict[str, str] = {}
 STATIC_PATHS = {"/", "/index.html", "/app.js", "/styles.css"}
 ANALYSIS_SLOTS = threading.BoundedSemaphore(env_int("PLAYBALL_MAX_CONCURRENT_ANALYSES", 4, 1))
 
@@ -55,7 +54,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             odds_status = odds_provider_status()
             status = "degraded" if (
                 COLLECTOR_STATE["lastError"] or database_status == "error"
-                or (odds_status["configured"] and odds_status["lastError"])
+                or (odds_status["configured"] and (odds_status["lastError"] or odds_status.get("persistenceError")))
             ) else "ok"
             return self.send_json({
                 "status": status, "database": database_status,
@@ -63,9 +62,33 @@ class AppHandler(SimpleHTTPRequestHandler):
             }, 503 if database_status == "error" else 200)
         if parsed.path == "/api/performance":
             try:
-                requested_version = parse_qs(parsed.query).get("modelVersion", [""])[0]
+                params = parse_qs(parsed.query)
+                requested_version = params.get("modelVersion", [""])[0]
                 model_version = None if requested_version == "all" else (requested_version or active_model_version())
-                return self.send_json(STORE.performance_summary(model_version))
+                filters = {}
+                for field in ("start", "end"):
+                    value = params.get(field, [""])[0]
+                    if value:
+                        if datetime.strptime(value, "%Y-%m-%d").date().isoformat() != value:
+                            raise ValueError("날짜 형식은 YYYY-MM-DD여야 합니다.")
+                        filters[field] = value
+                if filters.get("start", "") > filters.get("end", "9999-12-31"):
+                    raise ValueError("시작 날짜는 종료 날짜보다 늦을 수 없습니다.")
+                team = params.get("team", ["all"])[0]
+                if team != "all":
+                    if team not in TEAM_CODES.values():
+                        raise ValueError("지원하지 않는 구단입니다.")
+                    filters["team"] = team
+                for field, maximum in (("page", 1000000), ("pageSize", 50)):
+                    value = params.get(field, [""])[0]
+                    if value:
+                        number = int(value)
+                        if not 1 <= number <= maximum:
+                            raise ValueError("페이지 범위가 잘못됐습니다.")
+                        filters["page_size" if field == "pageSize" else field] = number
+                return self.send_json(STORE.performance_summary(model_version, **filters))
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, 400)
             except Exception as exc:
                 self.log_error("performance read failed: %s", exc)
                 return self.send_json({"error": "성능 데이터를 읽지 못했습니다."}, 500)
@@ -75,21 +98,51 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not date:
                 return self.send_json({"error": "date가 필요합니다."}, 400)
             try:
-                datetime.strptime(date, "%Y-%m-%d")
+                selected_date = datetime.strptime(date, "%Y-%m-%d").date()
+                date = selected_date.isoformat()
             except ValueError:
                 return self.send_json({"error": "날짜 형식은 YYYY-MM-DD여야 합니다."}, 400)
             force = params.get("refresh", ["0"])[0] == "1"
+            mode = params.get("mode", ["auto"])[0]
+            if mode not in ("auto", "historical", "reanalysis"):
+                return self.send_json({"error": "지원하지 않는 조회 방식입니다."}, 400)
             if force:
                 expected_token = os.environ.get("PLAYBALL_REFRESH_TOKEN", "")
                 supplied_token = self.headers.get("X-Refresh-Token", "")
                 if not expected_token or not hmac.compare_digest(supplied_token, expected_token):
                     return self.send_json({"error": "강제 갱신 권한이 없습니다."}, 403)
+            is_past = selected_date < datetime.now(KST).date()
+            if mode == "historical" or (is_past and mode == "auto"):
+                try:
+                    return self.send_json(STORE.historical_analysis(date))
+                except Exception as exc:
+                    self.log_error("history read failed: %s", exc)
+                    return self.send_json({"error": "저장된 예측을 읽지 못했습니다."}, 500)
             if not ANALYSIS_SLOTS.acquire(blocking=False):
                 return self.send_json({"error": "분석 요청이 많습니다. 잠시 후 다시 시도해 주세요."}, 429)
             try:
-                analysis = analyze(date, force=force, refresh_odds=force)
-                STORE.save_analysis(analysis)
+                analysis = analyze(date, force=force, refresh_odds=force and not is_past)
+                analysis["viewMode"] = "reanalysis" if is_past else "live"
+                if is_past:
+                    analysis["snapshotEligible"] = False
+                    analysis["valueBetStatus"] = "reanalysis"
+                    analysis["valueBets"] = []
+                    for game in analysis["games"]:
+                        game["snapshotEligible"] = False
+                        game["valueBet"] = {"available": False, "recommendation": False, "reason": "현재 기록을 사용한 재분석"}
+                else:
+                    STORE.save_analysis(analysis)
+                history = STORE.prediction_history(date)
+                for game in analysis["games"]:
+                    game["predictionHistory"] = history.get(game["id"], [])
+                analysis["collectorStatus"] = dict(COLLECTOR_STATE) | {
+                    "enabled": os.environ.get("PLAYBALL_COLLECTOR_ENABLED", "1") != "0",
+                    "intervalSeconds": env_int("PLAYBALL_COLLECT_INTERVAL_SECONDS", 900, 60),
+                }
                 return self.send_json(analysis)
+            except DataContractError as exc:
+                self.log_error("upstream data invalid: %s", exc)
+                return self.send_json({"error": str(exc), "dataQuality": {"status": "invalid"}}, 502)
             except Exception as exc:
                 self.log_error("analysis failed: %s", exc)
                 return self.send_json({"error": "KBO 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."}, 502)
@@ -127,15 +180,19 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def _game_start_times(games: list[dict], now: datetime) -> list[datetime]:
+def _game_start_times(games: list[dict], now: datetime, include_started: bool = False) -> list[datetime]:
     starts = []
     for game in games:
-        state = game.get("GAME_STATE_SC")
-        if bool(game.get("GAME_RESULT_CK")) or (state is not None and str(state) != "1"):
+        if cancelled_game(game):
             continue
+        state = game.get("GAME_STATE_SC")
         try:
             hour, minute = map(int, str(game.get("G_TM", "")).strip()[:5].split(":"))
-            starts.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
+            start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            pending = not bool(game.get("GAME_RESULT_CK")) and (state is None or str(state) == "1")
+            started = start <= now and (bool(game.get("GAME_RESULT_CK")) or str(state) == "2")
+            if pending or (include_started and started):
+                starts.append(start)
         except (TypeError, ValueError):
             continue
     return sorted(starts)
@@ -143,7 +200,7 @@ def _game_start_times(games: list[dict], now: datetime) -> list[datetime]:
 
 def collector_odds_slot(games: list[dict], now: datetime) -> str | None:
     """현재 시각까지 도달한 가장 최근 배당 수집 슬롯을 반환한다."""
-    starts = _game_start_times(games, now)
+    starts = _game_start_times(games, now, include_started=True)
     if not starts or now >= starts[0]:
         return None
     slots = (
@@ -156,10 +213,10 @@ def collector_odds_slot(games: list[dict], now: datetime) -> str | None:
 
 
 def collector_analysis_due(games: list[dict], now: datetime) -> bool:
-    """경기가 있는 날 오전 9시부터 첫 경기 시작 전까지만 분석한다."""
+    """오전 9시부터 마지막 미시작 경기의 라인업까지 분석한다."""
     starts = _game_start_times(games, now)
     morning = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    return bool(starts and morning <= now < starts[0])
+    return bool(starts and morning <= now < starts[-1])
 
 
 def background_collector() -> None:
@@ -169,27 +226,35 @@ def background_collector() -> None:
         errors = []
         now = datetime.now(KST)
         today = now.date().isoformat()
+        schedule_ok = False
         try:
             games = fetch_games(today)
+            schedule_ok = True
         except Exception as exc:
             games = []
             errors.append(f"schedule: {type(exc).__name__}")
             print(f"background schedule failed: {exc}", flush=True)
         if collector_analysis_due(games, now):
             odds_slot = collector_odds_slot(games, now)
-            refresh_odds = bool(odds_slot and COLLECTOR_ODDS_SLOTS.get(today) != odds_slot)
             try:
+                refresh_odds = bool(odds_slot and odds_provider_status()["configured"]
+                                    and STORE.claim_odds_slot(today, odds_slot))
                 STORE.save_analysis(analyze(today, force=True, refresh_odds=refresh_odds))
                 if refresh_odds:
-                    COLLECTOR_ODDS_SLOTS.clear()
-                    COLLECTOR_ODDS_SLOTS[today] = odds_slot
                     COLLECTOR_STATE["lastOddsSlot"] = f"{today}:{odds_slot}"
                 COLLECTOR_STATE["lastAnalysis"] = datetime.now(KST).isoformat(timespec="seconds")
             except Exception as exc:
                 errors.append(f"analysis: {type(exc).__name__}")
                 print(f"background analysis failed: {exc}", flush=True)
         try:
-            STORE.sync_results(fetch_games)
+            def report_result_error(date, exc):
+                errors.append(f"results {date}: {type(exc).__name__}")
+                print(f"background result sync failed for {date}: {exc}", flush=True)
+
+            STORE.sync_results(
+                lambda date: games if schedule_ok and date == today else fetch_games(date),
+                on_error=report_result_error,
+            )
             COLLECTOR_STATE["lastResultSync"] = datetime.now(KST).isoformat(timespec="seconds")
         except Exception as exc:
             errors.append(f"results: {type(exc).__name__}")

@@ -11,8 +11,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from kbo_analysis import BASE_MODEL_VERSION  # noqa: E402
+from kbo_analysis import BASE_MODEL_VERSION, calibrate_probability  # noqa: E402
 from storage import PredictionStore  # noqa: E402
+from artifact_io import atomic_write_json  # noqa: E402
+from scripts.forward_evaluation import raw_probability  # noqa: E402
 
 
 KST = timezone(timedelta(hours=9))
@@ -39,22 +41,41 @@ def fit_platt(probabilities: list[float], outcomes: list[float]) -> tuple[float,
     return slope, intercept
 
 
+def chronological_split(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    dates = sorted({row["prediction_date"] for row in rows})
+    if len(dates) < 3:
+        raise SystemExit("학습 중단: 서로 다른 학습·검증·테스트 날짜가 필요합니다.")
+    train_end = min(max(1, int(len(dates) * 0.6)), len(dates) - 2)
+    validation_end = min(train_end + max(1, int(len(dates) * 0.2)), len(dates) - 1)
+    train_dates, validation_dates = set(dates[:train_end]), set(dates[train_end:validation_end])
+    ordered = sorted(rows, key=lambda row: (row["prediction_date"], row.get("game_id", "")))
+    return (
+        [row for row in ordered if row["prediction_date"] in train_dates],
+        [row for row in ordered if row["prediction_date"] in validation_dates],
+        [row for row in ordered if row["prediction_date"] not in train_dates | validation_dates],
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PLAYBALL Platt calibration 학습")
     parser.add_argument("--db", default="data/playball.db")
     parser.add_argument("--output", default="data/calibration.json")
     parser.add_argument("--minimum-games", type=int, default=100)
+    parser.add_argument("--minimum-evaluation-games", type=int, default=20)
     args = parser.parse_args()
-    rows = [
-        row for row in PredictionStore(args.db).evaluated_predictions(BASE_MODEL_VERSION)
-        if row["winner"] is not None
-    ]
+    rows = []
+    for row in PredictionStore(args.db).evaluated_predictions(BASE_MODEL_VERSION, include_payload=True, include_calibrated=True):
+        if row["winner"] is None or not (row["model_version"] == BASE_MODEL_VERSION
+                or row["model_version"].startswith(BASE_MODEL_VERSION + "+platt-")):
+            continue
+        probability = raw_probability(row)
+        if probability is not None:
+            rows.append({**row, "home_probability": probability})
     if len(rows) < args.minimum_games:
         raise SystemExit(f"학습 중단: 최소 {args.minimum_games}경기가 필요하지만 현재 {len(rows)}경기입니다.")
-    split = max(1, int(len(rows) * 0.8))
-    train, validation = rows[:split], rows[split:]
-    if not validation:
-        raise SystemExit("학습 중단: 검증 구간이 없습니다.")
+    train, validation, test = chronological_split(rows)
+    if min(len(validation), len(test)) < max(args.minimum_evaluation_games, 1):
+        raise SystemExit(f"학습 중단: 검증과 테스트에 각각 최소 {args.minimum_evaluation_games}경기가 필요합니다.")
     train_p = [row["home_probability"] for row in train]
     train_y = [float(row["winner"] == row["home_team"]) for row in train]
     if len(set(train_y)) < 2:
@@ -63,23 +84,32 @@ def main() -> None:
     validation_p = [row["home_probability"] for row in validation]
     validation_y = [float(row["winner"] == row["home_team"]) for row in validation]
     calibrated_p = [
-        sigmoid(slope * math.log(min(max(p, 0.001), 0.999) / (1 - min(max(p, 0.001), 0.999))) + intercept)
+        calibrate_probability(p, {"slope": slope, "intercept": intercept})
         for p in validation_p
     ]
     baseline_brier = brier(validation_p, validation_y)
     calibrated_brier = brier(calibrated_p, validation_y)
     if calibrated_brier >= baseline_brier:
         raise SystemExit(f"활성화 중단: 검증 Brier가 개선되지 않았습니다 ({baseline_brier:.4f} → {calibrated_brier:.4f}).")
+    # 별도 테스트 구간은 학습·활성화 판정에 사용하지 않고 최종 성능만 기록한다.
+    test_p = [row["home_probability"] for row in test]
+    test_y = [float(row["winner"] == row["home_team"]) for row in test]
+    test_calibrated = [calibrate_probability(p, {"slope": slope, "intercept": intercept}) for p in test_p]
     payload = {
         "kind": "platt", "enabled": True, "baseModelVersion": BASE_MODEL_VERSION,
         "slope": slope, "intercept": intercept,
         "trainedAt": datetime.now(KST).isoformat(timespec="seconds"), "samples": len(rows),
         "trainSamples": len(train), "validationSamples": len(validation),
+        "testSamples": len(test), "splitMethod": "date-60-20-20",
+        "dateRanges": {name: [part[0]["prediction_date"], part[-1]["prediction_date"]]
+                       for name, part in (("train", train), ("validation", validation), ("test", test))},
         "baselineBrier": round(baseline_brier, 6), "calibratedBrier": round(calibrated_brier, 6),
+        "testBaselineBrier": round(brier(test_p, test_y), 6),
+        "testCalibratedBrier": round(brier(test_calibrated, test_y), 6),
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output, payload)
     print(f"보정기 저장: {output} ({baseline_brier:.4f} → {calibrated_brier:.4f})")
 
 
