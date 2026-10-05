@@ -3,9 +3,9 @@
   --paper: #f2f0e8;
   --panel: #fbfaf4;
   --line: #d8d5ca;
-  --muted: #716f68;
+  --muted: #625f58;
   --green: #31dc78;
-  --green-dark: #167a45;
+  --green-dark: #126738;
   --orange: #ff6b35;
   --yellow: #f4ce48;
   --shadow: 0 18px 55px rgba(7, 19, 15, 0.08);
@@ -174,7 +174,9 @@ main { overflow: hidden; }
 .position-filters { max-width: 1200px; margin: 0 auto 22px; display: flex; gap: 7px; overflow-x: auto; padding-bottom: 3px; scrollbar-width: none; }
 .position-filters::-webkit-scrollbar { display: none; }
 .position-button { flex: 0 0 auto; border: 1px solid #cbc8bc; border-radius: 100px; padding: 8px 15px; background: transparent; font-size: 12px; font-weight: 700; cursor: pointer; }
-.position-button:hover, .position-button.active { background: var(--ink); border-color: var(--ink); color: white; }
+.position-button:hover, .position-button.active, #historyControls [aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: white; }
+#historyControls { max-width: 1152px; padding: 0 16px; }
+#historyControls[hidden] { display: none; }
 .hitter-content { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 1.45fr 1fr; gap: 16px; }
 .hitter-feature { min-height: 277px; border-radius: 12px; background: var(--ink); color: white; padding: 28px 30px; position: relative; overflow: hidden; display: grid; grid-template-columns: 1fr auto; align-items: center; }
 .hitter-feature::after { content: attr(data-number); position: absolute; right: -5px; bottom: -52px; color: rgba(49,220,120,.08); font: 900 230px/1 "IBM Plex Mono", monospace; }
@@ -277,4 +279,155 @@ footer { min-height: 110px; padding: 25px max(24px, calc((100vw - 1200px) / 2));
   .metric-grid article { min-height: 105px; }
   .result-row { grid-template-columns: 1fr auto; }
   .result-row time { grid-column: 1 / -1; }
+}
+
+/* 조회 설정과 키보드·모바일 탐색 */
+[hidden] { display: none !important; }
+button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 3px solid var(--orange); outline-offset: 4px;
+}
+button:disabled { opacity: .5; cursor: wait; }
+.skip-link { position: fixed; left: 16px; top: -100px; z-index: 100; padding: 12px; background: white; border: 2px solid var(--ink); }
+.skip-link:focus { top: 12px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.mobile-nav { display: none; }
+.view-toolbar { max-width: 1152px; margin: 0 auto 20px; display: flex; align-items: center; flex-wrap: wrap; gap: 12px; font-size: 12px; }
+.view-toolbar select, .toolbar-button, .performance-filter select { min-height: 42px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+.toolbar-button { cursor: pointer; font-weight: 700; }
+.auto-refresh { display: flex; align-items: center; gap: 6px; min-height: 42px; }
+.auto-refresh input { width: 18px; height: 18px; accent-color: var(--green-dark); }
+#updateStatus { flex-basis: 100%; color: var(--muted); font-size: 11px; }
+.game-summary { color: var(--muted); font-size: 12px; margin: -12px 0 20px; }
+.game-status { padding: 0 20px 16px; color: var(--green-dark); font-size: 11px; }
+.prediction-timeline { padding-left: 20px; margin-top: 8px; max-height: 240px; overflow: auto; }
+.refresh-error { margin-bottom: 0; color: #8b3a28; }
+.performance-filter { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; font-size: 12px; color: #b5c3bb; }
+.evaluation-note { grid-column: 1 / -1; margin: 0; padding: 14px 16px; border: 1px solid #385046; border-radius: 9px; color: #b5c3bb; font-size: 12px; line-height: 1.7; }
+.calibration-summary { grid-column: 1 / -1; border: 1px solid #294137; border-radius: 9px; padding: 20px; }
+.calibration-summary h3 { margin-top: 0; font-size: 14px; }
+.calibration-summary p { color: #aab9b1; font-size: 12px; }
+.calibration-summary table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
+.calibration-summary th, .calibration-summary td { padding: 10px; border-bottom: 1px solid #294137; }
+.native-date:focus { position: absolute; left: 50%; top: 18px; transform: translateX(-50%); z-index: 2; opacity: 1; width: 160px; height: 42px; pointer-events: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.section-description, .metric-grid small, .game-meta { overflow-wrap: anywhere; }
+.game-meta { gap: 12px; }
+.game-meta strong { flex-shrink: 0; }
+.value-section .empty-state strong, .performance-section .empty-state strong { color: white; }
+.value-section .empty-state, .performance-section .empty-state { color: #b3c0b8; border-color: #385046; }
+@media (max-width: 800px) {
+  .mobile-nav { display: flex; overflow-x: auto; gap: 4px; background: var(--ink); color: #c4cfc8; padding: 8px 16px; }
+  .mobile-nav a { flex: 1 0 auto; padding: 10px 12px; text-align: center; font-size: 12px; }
+  .view-toolbar { margin-left: 16px; margin-right: 16px; gap: 8px; }
+  .position-button { min-height: 44px; }
+  .date-bar { padding-left: 12px; padding-right: 12px; }
+}
+@media (max-width: 480px) {
+  .today-button { display: block; padding: 8px; }
+  .date-display span { font-size: 14px; }
+  .date-display { min-width: 160px; }
+  .icon-button { width: 36px; min-height: 44px; }
+  .ranking-unit { max-width: 85px; line-height: 1.6; text-align: right; }
+  .runner-card { padding: 14px 12px; gap: 8px; grid-template-columns: 24px minmax(0, 1fr) auto; }
+  .runner-card p { overflow-wrap: anywhere; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+.value-metrics small, .value-metrics span { color: #abb9b1; }
+.performance-section .ranking-unit span { color: var(--green); }
+.result-row time, .result-row span { color: #a0b2a8; }
+
+.hitter-game-filter { max-width: 1200px; margin: 0 auto 16px; display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; }
+.hitter-game-filter select { max-width: 70%; min-height: 44px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--panel); }
+.value-card.no-bet { opacity: 1; }
+@media (max-width: 480px) {
+  .hitter-feature { min-height: auto; }
+  .probability-ring { position: relative; right: auto; bottom: auto; justify-self: end; margin-top: 20px; }
+}
+@media (min-width: 360px) and (max-width: 480px) {
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-grid article { padding: 16px 12px; }
+}
+
+.runner-card > strong { color: var(--muted); }
+
+/* 날짜 요약·경기 상세·성능 범위 */
+.daily-summary { max-width: 1152px; margin: 0 auto 24px; padding: 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.daily-summary h2 { margin: 0 0 16px; font-size: 18px; }
+.summary-metrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 12px; }
+.summary-metrics div { display: grid; gap: 4px; }
+.summary-metrics strong { font: 600 28px 'IBM Plex Mono',monospace; }
+.summary-metrics span, .daily-summary p { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.summary-changes { font-size: 12px; line-height: 1.8; }
+summary { cursor: pointer; min-height: 32px; padding: 8px 0; font-weight: 700; }
+summary:focus-visible { outline: 3px solid var(--orange); outline-offset: 3px; }
+.detail-button { width: 100%; padding: 14px; border: 0; border-top: 1px solid var(--line); color: var(--ink); background: var(--panel); font-weight: 700; cursor: pointer; font-size: 12px; }
+#gameDetail { width: min(860px,calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink); }
+#gameDetail::backdrop { background: rgba(0,0,0,.7); }
+.detail-header { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; background: var(--panel); border-bottom: 1px solid var(--line); z-index: 1; }
+.detail-header h2 { margin: 0; font-size: 18px; overflow-wrap: anywhere; }
+#detailContent { padding: 20px; font-size: 13px; line-height: 1.8; }
+#detailContent section { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 12px; }
+.detail-mode,.detail-empty { color: var(--muted); }
+.detail-lineups { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.lineup-list { list-style: none; padding: 0; }
+.lineup-list li { padding: 5px 0; border-bottom: 1px solid var(--line); }
+.lineup-list b { display: inline-block; min-width: 30px; }
+.lineup-list span { color: var(--muted); margin-left: 12px; }
+.detail-table { width: 100%; border-collapse: collapse; text-align: left; }
+.detail-table th,.detail-table td { padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+.detail-table small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+.detail-table caption { text-align: left; color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.table-scroll { overflow-x: auto; }
+.table-scroll .detail-table { min-width: 500px; }
+.history-chart { width: 100%; height: 180px; overflow: visible; }
+.history-chart line { stroke: var(--green-dark); stroke-width: 2; }
+.history-chart circle { fill: var(--green-dark); }
+.history-chart text { fill: var(--muted); font-size: 9px; }
+.chart-axis { fill: none; stroke: var(--line); }
+.performance-filter { flex-wrap: wrap; align-items: end; }
+.performance-filter label { display: grid; gap: 6px; }
+.performance-filter input { min-height: 42px; min-width: 0; max-width: 100%; padding: 8px; border: 1px solid #385046; border-radius: 6px; background: var(--panel); color: var(--ink); }
+.performance-scope { color: #b5c3bb; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.performance-pages { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 20px; font-size: 12px; color: #b5c3bb; }
+.monthly-performance { grid-column: 1 / -1; padding: 20px; border: 1px solid #385046; border-radius: 9px; }
+.monthly-performance h3 { margin-top: 0; font-size: 15px; }
+.monthly-performance p { color: #b5c3bb; font-size: 12px; line-height: 1.8; }
+.monthly-performance table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; }
+.monthly-performance th,.monthly-performance td { padding: 10px 4px; border-bottom: 1px solid #385046; }
+.monthly-bars div { display: grid; grid-template-columns: 65px minmax(0,1fr) 110px; align-items: center; gap: 8px; font-size: 12px; margin: 12px 0; }
+.monthly-bars i { display: block; height: 12px; background: var(--green); border-radius: 3px; }
+.monthly-bars b { font-size: 11px; text-align: right; }
+@media(max-width:800px) {
+ .hero { padding: 24px 16px; gap: 0; }
+ .hero h1 { font-size: 32px; margin-bottom: 0; }
+ .hero h1 br { display: none; }
+ .hero-copy > p,.hero-score { display: none; }
+ .hero .eyebrow { font-size: 9px; }
+ .daily-summary { margin: 0 16px 20px; padding: 16px; }
+ .daily-summary h2 { font-size: 15px; }
+ .summary-metrics strong { font-size: 24px; }
+ .summary-metrics span { font-size: 11px; }
+ .mobile-nav { position: sticky; top: 0; z-index: 5; }
+ .content-section { scroll-margin-top: 60px; }
+ .performance-filter label { width: calc(50% - 6px); min-width: 0; }
+ .performance-filter select { width: 100%; min-width: 0; }
+ .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+ .metric-grid article { padding: 14px 10px; min-height: 100px; }
+ .metric-grid strong { font-size: 25px; }
+ .metric-grid small { font-size: 10px; }
+ .performance-pages { gap: 6px; }
+ .performance-pages button { padding: 8px; }
+}
+@media(max-width:480px) {
+ .detail-lineups { grid-template-columns: 1fr; gap: 0; }
+ #gameDetail { width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
+ .detail-header,#detailContent { padding: 14px; }
+ .detail-header h2 { font-size: 16px; }
+ .detail-header .toolbar-button { flex-shrink: 0; }
+ .summary-metrics { gap: 6px; }
+ .monthly-performance { padding: 14px; }
+ .monthly-bars div { grid-template-columns: 52px minmax(0,1fr) 95px; gap: 5px; font-size: 11px; }
 }

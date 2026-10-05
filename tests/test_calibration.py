@@ -1,10 +1,53 @@
 import unittest
+import json
+import tempfile
+from datetime import date, timedelta
+from pathlib import Path
+from unittest.mock import patch
 
-from kbo_analysis import calibrate_probability
-from scripts.train_calibrator import brier, fit_platt, sigmoid
+from kbo_analysis import BASE_MODEL_VERSION, calibrate_probability, load_calibrator, calibrator_model_version, analyze
+import kbo_analysis
+from artifact_io import atomic_write_json
+from scripts.train_calibrator import brier, fit_platt, sigmoid, main, chronological_split
 
 
 class CalibrationTest(unittest.TestCase):
+    def test_different_coefficients_and_training_provenance_have_different_versions(self):
+        first = {"kind": "platt", "slope": 1.0, "intercept": 0.0, "trainedAt": "first"}
+        second = {**first, "slope": 2.0}
+        self.assertNotEqual(calibrator_model_version(first), calibrator_model_version(second))
+        self.assertNotEqual(calibrator_model_version(first), calibrator_model_version({**first, "trainedAt": "second"}))
+        self.assertEqual(calibrator_model_version(first), calibrator_model_version(dict(reversed(list(first.items())))))
+
+    def test_activation_replacement_and_disable_invalidate_cached_analysis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            with patch.dict("kbo_analysis.os.environ", {"PLAYBALL_CALIBRATION_PATH": str(path)}), \
+                 patch.dict(kbo_analysis._cache, {}, clear=True), patch.dict(kbo_analysis._inflight, {}, clear=True), \
+                 patch("kbo_analysis._analyze_uncached", side_effect=lambda _: {
+                     "games": [], "methodVersion": kbo_analysis.active_model_version()}) as compute:
+                self.assertEqual(analyze("2026-10-02")["methodVersion"], BASE_MODEL_VERSION)
+                payload = {"enabled": True, "kind": "platt", "baseModelVersion": BASE_MODEL_VERSION,
+                           "slope": 1.0, "intercept": 0.0}
+                atomic_write_json(path, payload)
+                first = analyze("2026-10-02")["methodVersion"]
+                atomic_write_json(path, {**payload, "slope": 2.0})
+                second = analyze("2026-10-02")["methodVersion"]
+                self.assertNotEqual(first, second)
+                atomic_write_json(path, {**payload, "enabled": False})
+                self.assertEqual(analyze("2026-10-02")["methodVersion"], BASE_MODEL_VERSION)
+                self.assertEqual(compute.call_count, 4)
+
+    def test_atomic_write_failure_preserves_the_previous_calibrator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            atomic_write_json(path, {"previous": True})
+            with patch("artifact_io.os.replace", side_effect=OSError("disk failure")):
+                with self.assertRaises(OSError):
+                    atomic_write_json(path, {"replacement": True})
+            self.assertEqual(json.loads(path.read_text()), {"previous": True})
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
     def test_platt_fit_reduces_overconfidence(self):
         probabilities = [0.8] * 50 + [0.2] * 50
         outcomes = ([1.0] * 30 + [0.0] * 20) + ([1.0] * 20 + [0.0] * 30)
@@ -19,6 +62,95 @@ class CalibrationTest(unittest.TestCase):
         calibrator = {"enabled": True, "kind": "platt", "baseModelVersion": "stats-v5-context-value", "slope": 3.0, "intercept": 0.0}
         self.assertEqual(calibrate_probability(0.99, calibrator), 0.8)
         self.assertEqual(calibrate_probability(0.01, calibrator), 0.2)
+
+    def test_calibrator_from_a_previous_model_is_not_activated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            path.write_text(json.dumps({"enabled": True, "kind": "platt", "baseModelVersion": "stats-v5-context-value",
+                                        "slope": 1.0, "intercept": 0.0}))
+            with patch.dict("kbo_analysis.os.environ", {"PLAYBALL_CALIBRATION_PATH": str(path)}):
+                self.assertIsNone(load_calibrator())
+                payload = json.loads(path.read_text())
+                payload["baseModelVersion"] = BASE_MODEL_VERSION
+                path.write_text(json.dumps(payload))
+                self.assertIsNotNone(load_calibrator())
+
+    def test_malformed_calibration_file_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            with patch.dict("kbo_analysis.os.environ", {"PLAYBALL_CALIBRATION_PATH": str(path)}):
+                for payload in ([], {"enabled": True, "kind": "platt", "baseModelVersion": BASE_MODEL_VERSION,
+                                     "slope": "invalid", "intercept": 0},
+                                {"enabled": True, "kind": "platt", "baseModelVersion": BASE_MODEL_VERSION,
+                                 "slope": True, "intercept": 0},
+                                {"enabled": True, "kind": "platt", "baseModelVersion": BASE_MODEL_VERSION,
+                                 "slope": 1, "intercept": 0, "testBrier": float("inf")}):
+                    path.write_text(json.dumps(payload))
+                    self.assertIsNone(load_calibrator())
+
+    def training_rows(self, validation):
+        train = [{"home_probability": 0.5, "winner": "LG" if i % 2 else "두산", "home_team": "LG"}
+                 for i in range(84)]
+        rows = train + [{"home_probability": p, "winner": "LG" if y else "두산", "home_team": "LG"}
+                        for p, y in validation * 2]
+        for index, row in enumerate(rows):
+            row["model_version"] = BASE_MODEL_VERSION
+            row["prediction_date"] = (date(2026, 4, 1) + timedelta(days=index // 4)).isoformat()
+            row["game_id"] = str(index)
+        return rows
+
+    def test_validation_reports_the_probability_used_in_production(self):
+        rows = self.training_rows([(0.72, 1)] * 28)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "calibration.json"
+            with patch("scripts.train_calibrator.PredictionStore") as store, \
+                 patch("scripts.train_calibrator.fit_platt", return_value=(0.0, 30.0)), \
+                 patch("sys.argv", ["train_calibrator", "--output", str(output)]):
+                store.return_value.evaluated_predictions.return_value = rows
+                main()
+            payload = json.loads(output.read_text())
+        self.assertEqual(payload["calibratedBrier"], 0.04)
+        self.assertEqual(payload["testCalibratedBrier"], 0.04)
+        self.assertEqual(payload["testSamples"], 28)
+
+    def test_split_keeps_dates_together_and_reserves_a_later_test_period(self):
+        rows = self.training_rows([(0.72, 1)] * 28)
+        train, validation, test = chronological_split(list(reversed(rows)))
+        parts = [{row["prediction_date"] for row in part} for part in (train, validation, test)]
+        self.assertLess(max(parts[0]), min(parts[1]))
+        self.assertLess(max(parts[1]), min(parts[2]))
+        self.assertEqual(len(train) + len(validation) + len(test), len(rows))
+
+    def test_holdout_outcomes_are_not_used_for_fitting_or_validation_selection(self):
+        rows = self.training_rows([(0.72, 1)] * 28)
+        for row in rows[-28:]:
+            row["winner"] = "두산"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "calibration.json"
+            with patch("scripts.train_calibrator.PredictionStore") as store, \
+                 patch("scripts.train_calibrator.fit_platt", return_value=(0.0, 30.0)) as fit, \
+                 patch("sys.argv", ["train_calibrator", "--output", str(output)]):
+                store.return_value.evaluated_predictions.return_value = rows
+                main()
+            payload = json.loads(output.read_text())
+        self.assertEqual(len(fit.call_args.args[0]), 84)
+        self.assertEqual(set(fit.call_args.args[0]), {0.5})
+        self.assertEqual(payload["calibratedBrier"], 0.04)
+        self.assertEqual(payload["testCalibratedBrier"], 0.64)
+
+    def test_rejects_improvement_that_disappears_after_runtime_clipping(self):
+        # 제한 없는 확률 ~1은 Brier 0.0714지만 실제 적용 확률 0.8은 0.0829다.
+        # 기본 예측은 0.0784이므로 실서비스 기준으로 보정기를 거부해야 한다.
+        rows = self.training_rows([(0.72, 1)] * 26 + [(0.28, 0)] * 2)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "calibration.json"
+            with patch("scripts.train_calibrator.PredictionStore") as store, \
+                 patch("scripts.train_calibrator.fit_platt", return_value=(0.0, 30.0)), \
+                 patch("sys.argv", ["train_calibrator", "--output", str(output)]):
+                store.return_value.evaluated_predictions.return_value = rows
+                with self.assertRaisesRegex(SystemExit, "검증 Brier가 개선되지 않았습니다"):
+                    main()
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

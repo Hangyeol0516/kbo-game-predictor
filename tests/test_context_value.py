@@ -1,4 +1,5 @@
 import unittest
+import hashlib
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -15,6 +16,10 @@ from kbo_analysis import (
 
 class ContextValueTest(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict("kbo_analysis.os.environ", {"PLAYBALL_ODDS_CACHE_PATH": ""})
+        environment.start()
+        self.addCleanup(environment.stop)
+        kbo_analysis._odds_restore_key = None
         kbo_analysis._odds_cache.update({"created": 0.0, "regions": None, "credential": None, "eventsByDate": {}})
         kbo_analysis._odds_state.update({
             "lastFetch": None, "lastError": None, "creditsRemaining": None,
@@ -86,7 +91,7 @@ class ContextValueTest(unittest.TestCase):
     @patch("kbo_analysis._get_json_response", side_effect=RuntimeError("provider unavailable"))
     def test_provider_error_never_returns_stale_odds(self, _get_json_response):
         kbo_analysis._odds_cache.update({
-            "created": 1.0, "regions": "eu", "credential": "old", "eventsByDate": {
+            "created": 1.0, "regions": "eu", "credential": hashlib.sha256(b"secret").hexdigest()[:12], "eventsByDate": {
                 "2026-09-28": {("LG", "두산"): {"stale": True}},
             },
         })
@@ -95,10 +100,12 @@ class ContextValueTest(unittest.TestCase):
         }):
             self.assertEqual(fetch_market_odds("2026-09-28", refresh=True), {})
             self.assertEqual(odds_provider_status()["lastError"], "RuntimeError")
+            self.assertEqual(fetch_market_odds("2026-09-28"), {})
 
     @patch("kbo_analysis._get_json_response")
     def test_market_odds_uses_best_price_and_devigged_consensus(self, get_json_response):
         get_json_response.return_value = ([{
+            "id": "event-1",
             "away_team": "LG Twins", "home_team": "Doosan Bears",
             "commence_time": "2026-09-28T09:30:00Z",
             "bookmakers": [
@@ -118,7 +125,7 @@ class ContextValueTest(unittest.TestCase):
             "PLAYBALL_ODDS_API_KEY": "secret", "PLAYBALL_ODDS_REGIONS": "eu",
         }):
             self.assertEqual(fetch_market_odds("2026-09-28"), {})
-            market = fetch_market_odds("2026-09-28", refresh=True)[("LG", "두산")]
+            market = fetch_market_odds("2026-09-28", refresh=True)["event-1"]
             self.assertEqual(fetch_market_odds("2026-09-29"), {})
             refreshed = fetch_market_odds("2026-09-28", refresh=True)
             status = odds_provider_status()
@@ -130,7 +137,7 @@ class ContextValueTest(unittest.TestCase):
             + market["teams"]["두산"]["marketProbability"],
             1.0,
         )
-        self.assertEqual(refreshed[("LG", "두산")]["teams"]["LG"]["price"], 1.75)
+        self.assertEqual(refreshed["event-1"]["teams"]["LG"]["price"], 1.75)
         self.assertEqual(get_json_response.call_count, 2)
         self.assertEqual(status["creditsRemaining"], 499.0)
         self.assertEqual(status["eventCount"], 1)
